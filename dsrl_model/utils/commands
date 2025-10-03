@@ -1,0 +1,35 @@
+..\.venv\Scripts\python.exe -m dsrl_model.model_free.safetd3 
+  --task OfflinePointGoal1Gymnasium-v0 
+  --seed 0 
+  --device gpu 
+  --device-id 0 
+  --use-eval true 
+  --save-video false 
+  --batch-size 128 
+  --train-horizon 5 
+  --lr 1e-5 
+  --update-priority-buffer false 
+  --normalize-observation false 
+  --cost-model-path "" 
+  --bc-weight-binary false 
+  --use-validation false 
+  --act-train-use-logprob false 
+  --policy-type gaussian_mixture 
+  --dwbc-nu 0.5 
+  --cost-loss-type loss_1_bce 
+  --use-cost-attention false 
+  --use-cost-contrastive false 
+  --use-contrastive-loss false 
+  --pretrain-cost-contrastive false 
+  --use-td3-style-bc false 
+  --num-neg-extra-traj 10 
+  --use-expected-cost-pref false 
+  --bootstrap-lambda 0.3 
+  --bc-weight-temp 0.5 
+  --num-non-preferred 50 
+  --num-union -1 
+  --non-pref-noise 0.0
+
+  for exponential model - both contrastive options set to false
+  experimaent later with horizon
+  
