@@ -6,39 +6,75 @@ from tensorboard.backend.event_processing import event_accumulator
 
 def get_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--env", default="walker2d-medium-replay-v2") # OpenAI gym environment name or DSRL task
-    parser.add_argument("--seed", default=0, type=int)             # Sets Gym, PyTorch and Numpy seeds
-    parser.add_argument("--expid", default="debug", type=str)    # 
-    parser.add_argument("--device", default="cuda", type=str)      #
-    parser.add_argument("--save_model", default=1, type=int)       #
-    parser.add_argument('--debug', type=int, default=0)
-    parser.add_argument('--alpha', type=float, default=3.0)        # beta parameter in the paper, use alpha because of legacy
-    parser.add_argument('--n_behavior_epochs', type=int, default=600)
-    parser.add_argument('--actor_load_path', type=str, default=None)
-    parser.add_argument('--diffusion_steps', type=int, default=15)
-    parser.add_argument('--M', type=int, default=64)               # support action number
-    parser.add_argument('--seed_per_evaluation', type=int, default=100)
-    parser.add_argument('--s', type=float, nargs="*", default=None)# guidance scale
-    parser.add_argument('--q_alpha', type=float, default=None)  
-    parser.add_argument('--schedule', type=str, default="linear")  
-    parser.add_argument('--K_renew', type=int, default=10)
+    # Environment and experiment
+    parser.add_argument("--task", "--env", dest="task", default="OfflinePointGoal1Gymnasium-v0", 
+                        help="DSRL task name")
+    parser.add_argument("--seed", default=0, type=int, help="Random seed")
+    parser.add_argument("--expid", default="debug", type=str, help="Experiment ID")
+    parser.add_argument("--experiment", default="energy_flow_dsrl", type=str, help="Experiment name")
+    parser.add_argument("--device", default="cuda", type=str, help="Device (cuda/cpu)")
+    parser.add_argument("--device_id", default=0, type=int, help="CUDA device ID")
     
-    # DSRL-specific arguments
-    parser.add_argument('--use_dsrl', action='store_true', help='Use DSRL safety datasets')
-    parser.add_argument('--reward_quantile', type=float, default=0.75, 
-                        help='Keep trajectories above this reward quantile (0-1)')
-    parser.add_argument('--cost_quantile', type=float, default=0.25,
-                        help='Keep trajectories below this cost quantile (0-1, lower = safer)')
+    # Training configuration
+    parser.add_argument('--alpha', type=float, default=3.0, help="Energy weighting parameter (beta in paper)")
+    parser.add_argument('--diffusion_steps', type=int, default=15, help="Number of diffusion sampling steps")
+    parser.add_argument('--M', type=int, default=64, help="Number of sampled actions for Q-training")
+    parser.add_argument('--schedule', type=str, default="OT", choices=["OT", "linear", "cosine"],
+                        help="Diffusion schedule")
+    parser.add_argument('--K_renew', type=int, default=10, help="Frequency to renew fake actions")
     
-    print("**************************")
+    # Dataset configuration (SafeTD3-style)
+    parser.add_argument('--num_non_preferred', '--num_negative', dest='num_non_preferred', 
+                        type=int, default=50, help="Number of non-preferred (high-cost) trajectories")
+    parser.add_argument('--num_union', type=int, default=-1, help="Number of union trajectories (-1 = all remaining)")
+    parser.add_argument('--train_horizon', type=int, default=5, help="Training horizon for trajectories")
+    parser.add_argument('--non_pref_noise', type=float, default=0.0, help="Noise for non-preferred selection")
+    parser.add_argument('--normalize_observation', action='store_true', help="Normalize observations")
+    
+    # Training hyperparameters (step-based, like SafeTD3)
+    parser.add_argument('--batch_size', type=int, default=256, help="Batch size")
+    parser.add_argument('--lr', type=float, default=3e-4, help="Learning rate")
+    parser.add_argument('--total_iteration', type=int, default=int(1e6), 
+                        help="Total training steps (iterations). Default 1M like SafeTD3")
+    parser.add_argument('--weight_decay', type=float, default=0.01, help="Weight decay")
+    parser.add_argument('--max_grad_norm', type=float, default=1.0, help="Max gradient norm for clipping")
+    
+    # Note: Training stages are automatically split as 60%/30%/10% of total_iteration
+    # Stage 1 (BC): 600k steps (60% of 1M)
+    # Stage 2 (Q): 300k steps (30% of 1M)  
+    # Stage 3 (Energy): 100k steps (10% of 1M)
+    
+    # Evaluation
+    parser.add_argument('--seed_per_evaluation', '--eval_episodes', dest='seed_per_evaluation', 
+                        type=int, default=10, help="Number of evaluation episodes")
+    parser.add_argument('--eval_freq', type=int, default=5000, help="Evaluation frequency (steps) - matches SafeTD3")
+    parser.add_argument('--use_eval', action='store_true', default=True, help="Enable evaluation")
+    
+    # Logging and saving
+    parser.add_argument('--log_dir', type=str, default="./logs", help="Log directory")
+    parser.add_argument('--log_freq', type=int, default=int(1e4), help="Logging frequency (steps)")
+    parser.add_argument('--save_freq', type=int, default=int(2e4), help="Model saving frequency (steps)")
+    parser.add_argument('--write_terminal', action='store_true', help="Write logs to terminal")
+    
+    # Legacy/optional
+    parser.add_argument('--debug', action='store_true', help="Debug mode (reduces to 1000 steps)")
+    parser.add_argument('--actor_load_path', type=str, default=None, help="Path to load pre-trained actor")
+    parser.add_argument('--q_alpha', type=float, default=None, help="Q-alpha value (defaults to alpha)")
+    parser.add_argument('--action_repeat', type=int, default=1, help="Action repeat")
+    
+    print("=" * 60)
     args = parser.parse_known_args()[0]
+    
     if args.debug:
-        args.actor_epoch =1
-        args.critic_epoch =1
-        args.env = "antmaze-medium-play-v2"
+        # Debug mode: reduce to 1000 steps (same as SafeTD3 debug)
+        args.total_iteration = 1000
+        print("DEBUG MODE: Reduced to 1000 total steps")
+        
     if args.q_alpha is None:
         args.q_alpha = args.alpha
+        
     print(args)
+    print("=" * 60)
     return args
 
 def bandit_get_args():

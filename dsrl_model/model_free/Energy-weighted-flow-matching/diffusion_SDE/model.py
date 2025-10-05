@@ -124,7 +124,12 @@ class ScoreBase(nn.Module):
     def select_actions(self, states, diffusion_steps=15):
         multiple_input=True
         with torch.no_grad():
-            states = torch.FloatTensor(states).to(self.device)
+            # Handle both numpy arrays and tensors
+            if not isinstance(states, torch.Tensor):
+                states = torch.FloatTensor(states).to(self.device)
+            else:
+                states = states.to(self.device)
+            
             if states.dim == 1:
                 states = states.unsqueeze(0)
                 multiple_input=False
@@ -153,8 +158,7 @@ class ScoreBase(nn.Module):
 class ScoreNet(ScoreBase):
     def __init__(self, input_dim, output_dim, marginal_prob_std, embed_dim=32, **kwargs):
         super().__init__(input_dim, output_dim, marginal_prob_std, embed_dim, **kwargs)
-        # The swish activation function
-        self.act = lambda x: x * torch.sigmoid(x)
+        # The swish activation function (removed unused lambda to enable pickling)
         self.pre_sort_condition = nn.Sequential(Dense(input_dim-output_dim, 32), SiLU())
         self.sort_t = nn.Sequential(
                         nn.Linear(64, 128),                        
