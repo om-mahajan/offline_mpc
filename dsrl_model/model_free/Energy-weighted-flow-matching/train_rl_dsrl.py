@@ -387,18 +387,23 @@ def main(args):
     config["flow_policy_steps"] = flow_policy_steps
     
     print("=" * 60)
-    print(f"DEBUG MODE: Reduced to {total_steps:,} total steps" if args.debug else f"FULL TRAINING: {total_steps:,} total steps")
+    print(f"DEBUG MODE: Reduced to {total_steps:,} total steps" if args.debug else f"FULL TRAINING: {total_steps:,} total env steps")
     print(args)
     print("=" * 60)
+    print(f"Step Counting (matching SafeTD3 convention):")
+    print(f"  'Steps' = Environment interactions (transitions processed)")
+    print(f"  1 gradient update = {args.batch_size} trajectories × {config['train_horizon']} timesteps = {args.batch_size * config['train_horizon']} transitions")
+    print(f"  Expected gradient updates: ~{total_steps // (args.batch_size * config['train_horizon']):,}")
+    print("=" * 60)
     print(f"Training steps distribution (Algorithm 1):")
-    print(f"  Step 1 - Pretrain Energy: {energy_pretrain_steps:,} steps ({config['pretrain_energy_ratio']*100:.0f}%)")
-    print(f"  Steps 2-5 - Flow + Policy: {flow_policy_steps:,} steps ({config['flow_policy_ratio']*100:.0f}%)")
-    print(f"  Total: {total_steps:,} steps")
-    print(f"  Training Horizon: {config['train_horizon']} steps")
-    print(f"  Batch Size: {args.batch_size}")
-    print(f"  Evaluation Frequency: Every {args.eval_freq:,} steps")
-    print(f"  Logging Frequency: Every {config['log_freq']:,} steps")
-    print(f"  Checkpoint Saving: Every {config['save_freq']:,} steps")
+    print(f"  Step 1 - Pretrain Energy: {energy_pretrain_steps:,} env steps ({config['pretrain_energy_ratio']*100:.0f}%)")
+    print(f"  Steps 2-5 - Flow + Policy: {flow_policy_steps:,} env steps ({config['flow_policy_ratio']*100:.0f}%)")
+    print(f"  Total: {total_steps:,} env steps")
+    print(f"  Training Horizon: {config['train_horizon']} timesteps")
+    print(f"  Batch Size: {args.batch_size} trajectories")
+    print(f"  Evaluation: Every {args.eval_freq:,} env steps (ONLY after energy pretrain)")
+    print(f"  Logging: Every {config['log_freq']:,} env steps")
+    print(f"  Checkpoint Saving: Every {config['save_freq']:,} env steps")
     print("=" * 60)
     
     # Create directories and setup logger (following SafeTD3 style)
@@ -485,8 +490,9 @@ def main(args):
     # Training loop following Algorithm 1
     print("=" * 60)
     print("Starting training (Algorithm 1: Energy-Weighted Flow Matching for BC)...")
-    print(f"  Step 1: Pretrain energy function ({energy_pretrain_steps:,} steps)")
-    print(f"  Steps 2-5: Energy-weighted flow + policy ({flow_policy_steps:,} steps)")
+    print(f"  Step 1: Pretrain energy function ({energy_pretrain_steps:,} env steps)")
+    print(f"  Steps 2-5: Energy-weighted flow + policy ({flow_policy_steps:,} env steps)")
+    print(f"  Note: 1 gradient update processes {args.batch_size * config['train_horizon']} transitions")
     
     max_reward, max_cost = -float('inf'), float('inf')
     eval_rew_deque = deque(maxlen=config["eval_episode_freq"])
@@ -498,37 +504,45 @@ def main(args):
     flow_loss = 0.0
     policy_loss = 0.0
     
-    steps = 0
+    # Steps = environment interactions (transitions processed)
+    # Each gradient update processes batch_size * train_horizon transitions
+    env_steps = 0
+    gradient_updates = 0
+    transitions_per_update = args.batch_size * config['train_horizon']
+    
     start_time = time.time()
     last_log_time = start_time
     
-    while steps < total_steps:
-        steps += 1
+    while env_steps < total_steps:
+        gradient_updates += 1
         
-        # Sample batch - this is one training step
+        # Sample batch - one gradient update
         neg_obs, neg_acts, union_obs, union_acts, union_rewards = sample_trajectory_batch(
             dataset_splits, args.batch_size, config['train_horizon'], device
         )
         
-        # Step 1: Pretrain energy function (first 20% of steps)
-        if steps <= energy_pretrain_steps:
+        # Count environment steps (transitions processed)
+        env_steps += transitions_per_update
+        
+        # Step 1: Pretrain energy function (first 20% of env_steps)
+        if env_steps <= energy_pretrain_steps:
             energy_loss, neg_loss, union_loss = pretrain_energy_function(
                 energy_model, energy_optimizer, 
                 neg_obs, neg_acts, union_obs, union_acts, 
                 args, config
             )
             
-            # Print progress every 1000 steps in energy pretraining
-            if steps % 1000 == 0:
+            # Print progress every 10k env steps in energy pretraining
+            if env_steps % 10000 == 0:
                 elapsed = time.time() - start_time
-                steps_per_sec = steps / elapsed
-                remaining_steps = energy_pretrain_steps - steps
+                steps_per_sec = env_steps / elapsed
+                remaining_steps = energy_pretrain_steps - env_steps
                 eta = remaining_steps / steps_per_sec if steps_per_sec > 0 else 0
-                print(f"[Energy Pretrain] Step {steps:,}/{energy_pretrain_steps:,} ({steps/energy_pretrain_steps*100:.1f}%) | "
-                      f"Loss: {energy_loss:.4f} | {steps_per_sec:.1f} steps/s | ETA: {eta/60:.1f}m")
+                print(f"[Energy Pretrain] Step {env_steps:,}/{energy_pretrain_steps:,} ({env_steps/energy_pretrain_steps*100:.1f}%) | "
+                      f"Loss: {energy_loss:.4f} | GradUpdates: {gradient_updates:,} | {steps_per_sec:.1f} env_steps/s | ETA: {eta/60:.1f}m")
             
             # Save checkpoint at end of energy pretraining
-            if steps == energy_pretrain_steps:
+            if env_steps >= energy_pretrain_steps and (env_steps - transitions_per_update) < energy_pretrain_steps:
                 print("=" * 60)
                 print("✓ Phase 1 Complete: Energy Pretraining Finished!")
                 print(f"  Total steps: {energy_pretrain_steps:,}")
@@ -552,15 +566,15 @@ def main(args):
                 args, config
             )
             
-            # Print progress every 1000 steps in flow training
-            if steps % 1000 == 0 and steps > energy_pretrain_steps:
+            # Print progress every 10k env steps in flow training
+            if env_steps % 10000 == 0 and env_steps > energy_pretrain_steps:
                 elapsed = time.time() - start_time
-                steps_per_sec = steps / elapsed
-                remaining_steps = total_steps - steps
+                steps_per_sec = env_steps / elapsed
+                remaining_steps = total_steps - env_steps
                 eta = remaining_steps / steps_per_sec if steps_per_sec > 0 else 0
-                phase2_progress = (steps - energy_pretrain_steps) / flow_policy_steps * 100
-                print(f"[Flow Training] Step {steps:,}/{total_steps:,} ({phase2_progress:.1f}% of Phase 2) | "
-                      f"Loss: {flow_loss:.4f} | {steps_per_sec:.1f} steps/s | ETA: {eta/60:.1f}m")
+                phase2_progress = (env_steps - energy_pretrain_steps) / flow_policy_steps * 100
+                print(f"[Flow Training] Step {env_steps:,}/{total_steps:,} ({phase2_progress:.1f}% of Phase 2) | "
+                      f"Loss: {flow_loss:.4f} | GradUpdates: {gradient_updates:,} | {steps_per_sec:.1f} env_steps/s | ETA: {eta/60:.1f}m")
             
             # Step 5: Update policy π_ψ with weighted behavior cloning loss
             # NOTE: Commented out for now - only training flow matching network
@@ -574,18 +588,18 @@ def main(args):
         # Logging and evaluation (following SafeTD3 style)
         logger.logged = False
         
-        if (steps % config["log_freq"] == 0) and (not logger.logged):
+        if (env_steps % config["log_freq"] == 0) and (not logger.logged):
             current_time = time.time()
             time_since_last_log = current_time - last_log_time
             last_log_time = current_time
             
-            # Evaluation (like SafeTD3)
-            if args.use_eval:
+            # Evaluation (like SafeTD3) - ONLY after energy pretraining completes
+            if args.use_eval and env_steps > energy_pretrain_steps:
                 eval_start_time = time.time()
                 # Use flow_model for evaluation (since we're only training flow, not policy)
                 eval_model = flow_model
                 
-                print(f"\n[Evaluation] Running {config['eval_episode_freq']} episodes at step {steps:,}...")
+                print(f"\n[Evaluation] Running {config['eval_episode_freq']} episodes at step {env_steps:,}...")
                 for eval_id in range(config['eval_episode_freq']):
                     eval_reward, eval_cost, eval_len = evaluate_policy(
                         eval_env, eval_model, device, norm_fn, args.diffusion_steps
@@ -611,12 +625,16 @@ def main(args):
                 if mean_rew > max_reward:
                     max_reward = mean_rew
                     best_path = os.path.join("./models_rl", str(args.expid), "flow_best.pth")
-                    if steps > energy_pretrain_steps:
-                        torch.save(flow_model.state_dict(), best_path)
-                        print(f"  ✓ New best model saved! Reward: {max_reward:.2f}")
+                    torch.save(flow_model.state_dict(), best_path)
+                    print(f"  ✓ New best model saved! Reward: {max_reward:.2f}")
+            
+            elif env_steps <= energy_pretrain_steps:
+                # During energy pretraining, skip evaluation
+                print(f"\n[Energy Pretrain] Skipping evaluation (flow model not trained yet)")
             
             # Log training metrics (like SafeTD3)
-            logger.log_tabular("Train/Steps", steps)
+            logger.log_tabular("Train/EnvSteps", env_steps)
+            logger.log_tabular("Train/GradientUpdates", gradient_updates)
             logger.log_tabular("Loss/Energy", energy_loss)
             logger.log_tabular("Loss/Flow", flow_loss)
             # NOTE: Policy not trained yet
@@ -628,7 +646,8 @@ def main(args):
             # NOTE: Policy not trained yet
             # logger.log_tabular("Norm/policy", get_params_norm(policy_model.parameters(), grads=False))
             
-            if args.use_eval:
+            # Only log eval time if evaluation was actually run
+            if args.use_eval and env_steps > energy_pretrain_steps:
                 logger.log_tabular("Time/Eval", eval_end_time - eval_start_time)
             
             logger.log_tabular("Time/StepsPerSec", config["log_freq"] / time_since_last_log)
@@ -637,21 +656,21 @@ def main(args):
             logger.dump_tabular()
         
         # Save periodic checkpoints (like SafeTD3)
-        if steps % config["save_freq"] == 0:
-            print(f"\n[Checkpoint] Saving models at step {steps:,}...")
+        if env_steps % config["save_freq"] == 0:
+            print(f"\n[Checkpoint] Saving models at env_step {env_steps:,} (grad_update {gradient_updates:,})...")
             logger.torch_save(
-                itr=steps,
+                itr=env_steps,
                 torch_saver_elements=energy_model,
                 prefix="energy",
             )
             logger.torch_save(
-                itr=steps,
+                itr=env_steps,
                 torch_saver_elements=flow_model,
                 prefix="flow",
             )
             # NOTE: Policy not trained yet, commented out
             # logger.torch_save(
-            #     itr=steps,
+            #     itr=env_steps,
             #     torch_saver_elements=policy_model,
             #     prefix="policy",
             # )
@@ -660,15 +679,16 @@ def main(args):
     # Final save (like SafeTD3)
     print("\n" + "=" * 60)
     print("Training Complete!")
-    print(f"  Total steps: {total_steps:,}")
+    print(f"  Total env steps: {total_steps:,}")
+    print(f"  Total gradient updates: {gradient_updates:,}")
     print(f"  Total time: {(time.time() - start_time)/60:.1f} minutes")
     print("=" * 60)
     print("Saving final models...")
     
-    logger.torch_save(itr=steps, torch_saver_elements=energy_model, prefix="energy")
-    logger.torch_save(itr=steps, torch_saver_elements=flow_model, prefix="flow")
+    logger.torch_save(itr=env_steps, torch_saver_elements=energy_model, prefix="energy")
+    logger.torch_save(itr=env_steps, torch_saver_elements=flow_model, prefix="flow")
     # NOTE: Policy not trained yet, commented out
-    # logger.torch_save(itr=steps, torch_saver_elements=policy_model, prefix="policy")
+    # logger.torch_save(itr=env_steps, torch_saver_elements=policy_model, prefix="policy")
     
     # Save normalization stats if used
     if config["normalize_observation"] and mu_obs is not None:
