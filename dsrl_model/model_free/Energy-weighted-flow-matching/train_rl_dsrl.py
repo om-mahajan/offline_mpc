@@ -20,7 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import Adam
 from torch.nn.utils.clip_grad import clip_grad_norm_
-import tqdm
+from tqdm import tqdm
 
 # DSRL imports
 import gymnasium as gym
@@ -53,12 +53,11 @@ default_cfg = {
     "update_tau": 0.005,
     "train_horizon": 5,
     "weight_decay": 0.01,
-    "total_iteration": int(1e6),
-    # Algorithm stages:
-    # 1. Pretrain energy function (discriminate D^N vs D^U)
-    # 2. Energy-weighted flow matching + policy update
-    "pretrain_energy_ratio": 0.2,  # 20% of steps for energy pretraining
-    "flow_policy_ratio": 0.8,      # 80% of steps for flow + policy
+    "energy_pretrain_iterations": int(5e5),  # 500K gradient updates for energy
+    "flow_train_iterations": int(1e6),       # 1M gradient updates for flow
+    # Algorithm stages (using gradient updates like SafeTD3):
+    # 1. Pretrain energy function (discriminate D^N vs D^U): 500K gradient updates
+    # 2. Energy-weighted flow matching: 1M gradient updates
     "evaluation_interval": 5,
 }
 
@@ -221,21 +220,21 @@ def train_energy_weighted_flow(score_model, optimizer, union_obs, union_acts, we
     # Set condition for diffusion model
     score_model.condition = flat_obs
     
-    # Compute diffusion loss (flow matching loss)
+    # Compute per-sample diffusion losses (flow matching loss)
     # The loss_fn internally computes: (ν_φ(t,x) - u_{t_0}(x,x_0))^2
-    # We apply weights to emphasize high-energy (good) samples
-    base_loss = diffusion_loss_fn(
-        score_model, 
-        flat_acts, 
-        args.marginal_prob_std_fn, 
-        energy=None,  # Don't use energy directly, apply weights instead
-        alpha=1.0  # No additional temperature scaling
-    )
+    eps = 1e-3
+    random_t = torch.rand(flat_acts.shape[0], device=flat_acts.device, dtype=flat_acts.dtype) * (1. - eps) + eps
+    z = torch.randn_like(flat_acts)
+    alpha_t, std = args.marginal_prob_std_fn(random_t)
+    alpha_t, std = alpha_t[:, None], std[:, None]
+    perturbed_x = flat_acts * alpha_t + z * std
+    score = score_model(perturbed_x, random_t)
     
-    # Apply energy weights: w*(s,a) · loss
-    # Note: We need to modify this to apply per-sample weights
-    # For now, use mean loss (will need custom loss function for per-sample weighting)
-    weighted_loss = base_loss  # TODO: Apply weights properly
+    # Per-sample losses: sum over action dimensions
+    per_sample_losses = torch.sum((score * std + z)**2, dim=1)
+    
+    # Apply energy weights: w*(s,a) · loss (Algorithm Step 4)
+    weighted_loss = torch.mean(flat_weights * per_sample_losses)
     
     optimizer.zero_grad()
     weighted_loss.backward()
@@ -368,42 +367,33 @@ def main(args):
     
     # Merge configs - convert epochs to steps
     # SafeTD3 uses steps (iterations), not epochs
-    # Typical: 1M total steps split across 3 stages
+    # Algorithm 1: Gradient Updates (like SafeTD3/SafeDICE)
     config = {**default_cfg}
     config["train_horizon"] = args.train_horizon
-    config["total_iteration"] = args.total_iteration
     config["log_freq"] = args.log_freq
     config["save_freq"] = args.save_freq
     config["normalize_observation"] = args.normalize_observation
     
-    # Calculate step boundaries for Algorithm 1
-    # Step 1: Pretrain energy function (~20% of total steps, e.g., 200k / 1M)
-    # Steps 2-5: Energy-weighted flow + policy (~80% of total steps, e.g., 800k / 1M)
-    total_steps = config["total_iteration"]
-    energy_pretrain_steps = int(total_steps * config['pretrain_energy_ratio'])
-    flow_policy_steps = total_steps - energy_pretrain_steps
-    
-    config["energy_pretrain_steps"] = energy_pretrain_steps
-    config["flow_policy_steps"] = flow_policy_steps
+    # Training iterations (gradient updates)
+    energy_pretrain_iterations = config["energy_pretrain_iterations"]  # 500K
+    flow_train_iterations = config["flow_train_iterations"]            # 1M
+    total_iterations = energy_pretrain_iterations + flow_train_iterations  # 1.5M total
     
     print("=" * 60)
-    print(f"DEBUG MODE: Reduced to {total_steps:,} total steps" if args.debug else f"FULL TRAINING: {total_steps:,} total env steps")
+    print(f"TRAINING MODE: GRADIENT UPDATES (like SafeTD3/SafeDICE)")
     print(args)
     print("=" * 60)
-    print(f"Step Counting (matching SafeTD3 convention):")
-    print(f"  'Steps' = Environment interactions (transitions processed)")
-    print(f"  1 gradient update = {args.batch_size} trajectories × {config['train_horizon']} timesteps = {args.batch_size * config['train_horizon']} transitions")
-    print(f"  Expected gradient updates: ~{total_steps // (args.batch_size * config['train_horizon']):,}")
+    print(f"Step Counting: 1 step = 1 gradient update (1 forward + 1 backward pass)")
+    print(f"  Batch size: {args.batch_size} trajectories × {config['train_horizon']} timesteps")
+    print(f"  Transitions per batch: {args.batch_size * config['train_horizon']}")
     print("=" * 60)
-    print(f"Training steps distribution (Algorithm 1):")
-    print(f"  Step 1 - Pretrain Energy: {energy_pretrain_steps:,} env steps ({config['pretrain_energy_ratio']*100:.0f}%)")
-    print(f"  Steps 2-5 - Flow + Policy: {flow_policy_steps:,} env steps ({config['flow_policy_ratio']*100:.0f}%)")
-    print(f"  Total: {total_steps:,} env steps")
-    print(f"  Training Horizon: {config['train_horizon']} timesteps")
-    print(f"  Batch Size: {args.batch_size} trajectories")
-    print(f"  Evaluation: Every {args.eval_freq:,} env steps (ONLY after energy pretrain)")
-    print(f"  Logging: Every {config['log_freq']:,} env steps")
-    print(f"  Checkpoint Saving: Every {config['save_freq']:,} env steps")
+    print(f"Training schedule (Algorithm 1):")
+    print(f"  Phase 1 - Energy Pretraining: {energy_pretrain_iterations:,} gradient updates")
+    print(f"  Phase 2 - Flow Training: {flow_train_iterations:,} gradient updates")
+    print(f"  Total: {total_iterations:,} gradient updates")
+    print(f"  Evaluation: Every {args.eval_freq:,} gradient updates (ONLY during flow training)")
+    print(f"  Logging: Every {args.log_freq:,} gradient updates")
+    print(f"  Checkpoint Saving: Every {args.save_freq:,} gradient updates")
     print("=" * 60)
     
     # Create directories and setup logger (following SafeTD3 style)
@@ -488,11 +478,9 @@ def main(args):
     policy_optimizer = Adam(policy_model.parameters(), lr=args.lr, weight_decay=config["weight_decay"])
     
     # Training loop following Algorithm 1
+    print("\n" + "=" * 60)
+    print("Starting training (Algorithm 1: Energy-Weighted Flow Matching)")
     print("=" * 60)
-    print("Starting training (Algorithm 1: Energy-Weighted Flow Matching for BC)...")
-    print(f"  Step 1: Pretrain energy function ({energy_pretrain_steps:,} env steps)")
-    print(f"  Steps 2-5: Energy-weighted flow + policy ({flow_policy_steps:,} env steps)")
-    print(f"  Note: 1 gradient update processes {args.batch_size * config['train_horizon']} transitions")
     
     max_reward, max_cost = -float('inf'), float('inf')
     eval_rew_deque = deque(maxlen=config["eval_episode_freq"])
@@ -502,191 +490,137 @@ def main(args):
     # Training variables
     energy_loss = 0.0
     flow_loss = 0.0
-    policy_loss = 0.0
-    
-    # Steps = environment interactions (transitions processed)
-    # Each gradient update processes batch_size * train_horizon transitions
-    env_steps = 0
-    gradient_updates = 0
-    transitions_per_update = args.batch_size * config['train_horizon']
     
     start_time = time.time()
-    last_log_time = start_time
     
-    while env_steps < total_steps:
-        gradient_updates += 1
+    # ==================== PHASE 1: ENERGY PRETRAINING ====================
+    print(f"\nPHASE 1: Energy Pretraining ({energy_pretrain_iterations:,} gradient updates)")
+    print("=" * 60)
+    
+    pbar = tqdm(range(energy_pretrain_iterations), desc="Phase 1: Energy", unit="grad", dynamic_ncols=True)
+    for grad_update in pbar:
+        steps = grad_update + 1  # 1-indexed for logging
         
-        # Sample batch - one gradient update
+        # Sample batch
         neg_obs, neg_acts, union_obs, union_acts, union_rewards = sample_trajectory_batch(
             dataset_splits, args.batch_size, config['train_horizon'], device
         )
         
-        # Count environment steps (transitions processed)
-        env_steps += transitions_per_update
+        # Energy pretraining: discriminate negative vs union
+        energy_loss, neg_loss, union_loss = pretrain_energy_function(
+            energy_model, energy_optimizer, 
+            neg_obs, neg_acts, union_obs, union_acts, 
+            args, config
+        )
         
-        # Step 1: Pretrain energy function (first 20% of env_steps)
-        if env_steps <= energy_pretrain_steps:
-            energy_loss, neg_loss, union_loss = pretrain_energy_function(
-                energy_model, energy_optimizer, 
-                neg_obs, neg_acts, union_obs, union_acts, 
-                args, config
-            )
-            
-            # Print progress every 10k env steps in energy pretraining
-            if env_steps % 10000 == 0:
-                elapsed = time.time() - start_time
-                steps_per_sec = env_steps / elapsed
-                remaining_steps = energy_pretrain_steps - env_steps
-                eta = remaining_steps / steps_per_sec if steps_per_sec > 0 else 0
-                print(f"[Energy Pretrain] Step {env_steps:,}/{energy_pretrain_steps:,} ({env_steps/energy_pretrain_steps*100:.1f}%) | "
-                      f"Loss: {energy_loss:.4f} | GradUpdates: {gradient_updates:,} | {steps_per_sec:.1f} env_steps/s | ETA: {eta/60:.1f}m")
-            
-            # Save checkpoint at end of energy pretraining
-            if env_steps >= energy_pretrain_steps and (env_steps - transitions_per_update) < energy_pretrain_steps:
-                print("=" * 60)
-                print("✓ Phase 1 Complete: Energy Pretraining Finished!")
-                print(f"  Total steps: {energy_pretrain_steps:,}")
-                print(f"  Final energy loss: {energy_loss:.4f}")
-                print(f"  Time elapsed: {(time.time() - start_time)/60:.1f} minutes")
-                print("=" * 60)
-                print("Starting Phase 2: Energy-Weighted Flow Matching Training...")
-                print("=" * 60)
+        # Update progress bar
+        pbar.set_postfix({'E_loss': f'{energy_loss:.4f}', 'Neg': f'{neg_loss:.4f}', 'Union': f'{union_loss:.4f}'})
         
-        # Steps 2-5: Energy-weighted flow and policy training (remaining 80% of steps)
-        else:
-            # Step 2: Compute energy weights w* = exp(E_η*) / Σ exp(E_η*)
-            weights = compute_energy_weights(
-                energy_model, union_obs, union_acts
-            )
-            
-            # Step 4: Update flow network ν_φ with energy-weighted flow matching loss
-            flow_loss = train_energy_weighted_flow(
-                flow_model, flow_optimizer, 
-                union_obs, union_acts, weights,
-                args, config
-            )
-            
-            # Print progress every 10k env steps in flow training
-            if env_steps % 10000 == 0 and env_steps > energy_pretrain_steps:
-                elapsed = time.time() - start_time
-                steps_per_sec = env_steps / elapsed
-                remaining_steps = total_steps - env_steps
-                eta = remaining_steps / steps_per_sec if steps_per_sec > 0 else 0
-                phase2_progress = (env_steps - energy_pretrain_steps) / flow_policy_steps * 100
-                print(f"[Flow Training] Step {env_steps:,}/{total_steps:,} ({phase2_progress:.1f}% of Phase 2) | "
-                      f"Loss: {flow_loss:.4f} | GradUpdates: {gradient_updates:,} | {steps_per_sec:.1f} env_steps/s | ETA: {eta/60:.1f}m")
-            
-            # Step 5: Update policy π_ψ with weighted behavior cloning loss
-            # NOTE: Commented out for now - only training flow matching network
-            # policy_loss = train_weighted_policy(
-            #     policy_model, policy_optimizer,
-            #     union_obs, union_acts, weights,
-            #     args, config
-            # )
-            policy_loss = 0.0  # Placeholder
-            
-        # Logging and evaluation (following SafeTD3 style)
-        logger.logged = False
-        
-        if (env_steps % config["log_freq"] == 0) and (not logger.logged):
-            current_time = time.time()
-            time_since_last_log = current_time - last_log_time
-            last_log_time = current_time
-            
-            # Evaluation (like SafeTD3) - ONLY after energy pretraining completes
-            if args.use_eval and env_steps > energy_pretrain_steps:
-                eval_start_time = time.time()
-                # Use flow_model for evaluation (since we're only training flow, not policy)
-                eval_model = flow_model
-                
-                print(f"\n[Evaluation] Running {config['eval_episode_freq']} episodes at step {env_steps:,}...")
-                for eval_id in range(config['eval_episode_freq']):
-                    eval_reward, eval_cost, eval_len = evaluate_policy(
-                        eval_env, eval_model, device, norm_fn, args.diffusion_steps
-                    )
-                    eval_rew_deque.append(eval_reward)
-                    eval_cost_deque.append(eval_cost)
-                    eval_len_deque.append(eval_len)
-                
-                eval_end_time = time.time()
-                
-                # Log evaluation metrics (like SafeTD3)
-                mean_rew = np.mean(eval_rew_deque)
-                mean_cost = np.mean(eval_cost_deque)
-                mean_len = np.mean(eval_len_deque)
-                
-                logger.log_tabular("Metrics/EvalEpRet", mean_rew)
-                logger.log_tabular("Metrics/EvalEpCost", mean_cost)
-                logger.log_tabular("Metrics/EvalEpLen", mean_len)
-                
-                print(f"  Reward: {mean_rew:.2f} | Cost: {mean_cost:.2f} | Length: {mean_len:.1f}")
-                
-                # Check for best model (save flow_model)
-                if mean_rew > max_reward:
-                    max_reward = mean_rew
-                    best_path = os.path.join("./models_rl", str(args.expid), "flow_best.pth")
-                    torch.save(flow_model.state_dict(), best_path)
-                    print(f"  ✓ New best model saved! Reward: {max_reward:.2f}")
-            
-            elif env_steps <= energy_pretrain_steps:
-                # During energy pretraining, skip evaluation
-                print(f"\n[Energy Pretrain] Skipping evaluation (flow model not trained yet)")
-            
-            # Log training metrics (like SafeTD3)
-            logger.log_tabular("Train/EnvSteps", env_steps)
-            logger.log_tabular("Train/GradientUpdates", gradient_updates)
+        # Logging
+        if steps % args.log_freq == 0:
+            logger.log_tabular("Train/GradUpdates", steps)
             logger.log_tabular("Loss/Energy", energy_loss)
-            logger.log_tabular("Loss/Flow", flow_loss)
-            # NOTE: Policy not trained yet
-            # logger.log_tabular("Loss/Policy", policy_loss)
-            
-            # Log model norms (like SafeTD3)
+            logger.log_tabular("Loss/Flow", 0.0)
             logger.log_tabular("Norm/energy", get_params_norm(energy_model.parameters(), grads=False))
             logger.log_tabular("Norm/flow", get_params_norm(flow_model.parameters(), grads=False))
-            # NOTE: Policy not trained yet
-            # logger.log_tabular("Norm/policy", get_params_norm(policy_model.parameters(), grads=False))
-            
-            # Only log eval time if evaluation was actually run
-            if args.use_eval and env_steps > energy_pretrain_steps:
-                logger.log_tabular("Time/Eval", eval_end_time - eval_start_time)
-            
-            logger.log_tabular("Time/StepsPerSec", config["log_freq"] / time_since_last_log)
-            logger.log_tabular("Time/TotalMinutes", (current_time - start_time) / 60)
-            
+            elapsed = time.time() - start_time
+            logger.log_tabular("Time/GradUpdatesPerSec", steps / elapsed)
+            logger.log_tabular("Time/TotalMinutes", elapsed / 60)
             logger.dump_tabular()
         
-        # Save periodic checkpoints (like SafeTD3)
-        if env_steps % config["save_freq"] == 0:
-            print(f"\n[Checkpoint] Saving models at env_step {env_steps:,} (grad_update {gradient_updates:,})...")
-            logger.torch_save(
-                itr=env_steps,
-                torch_saver_elements=energy_model,
-                prefix="energy",
-            )
-            logger.torch_save(
-                itr=env_steps,
-                torch_saver_elements=flow_model,
-                prefix="flow",
-            )
-            # NOTE: Policy not trained yet, commented out
-            # logger.torch_save(
-            #     itr=env_steps,
-            #     torch_saver_elements=policy_model,
-            #     prefix="policy",
-            # )
-            print(f"  ✓ Checkpoint saved")
+        # Checkpoint saving
+        if steps % args.save_freq == 0:
+            logger.torch_save(itr=steps, torch_saver_elements=energy_model, prefix="energy")
+            logger.torch_save(itr=steps, torch_saver_elements=flow_model, prefix="flow")
+    
+    print(f"\n✓ Phase 1 Complete: {energy_pretrain_iterations:,} gradient updates | Loss: {energy_loss:.4f}")
+    
+    # ==================== PHASE 2: FLOW TRAINING ====================
+    print(f"\nPHASE 2: Flow Training ({flow_train_iterations:,} gradient updates)")
+    print("=" * 60)
+    
+    pbar = tqdm(range(flow_train_iterations), desc="Phase 2: Flow", unit="grad", dynamic_ncols=True)
+    for grad_update in pbar:
+        steps = energy_pretrain_iterations + grad_update + 1  # Continue counting from Phase 1
+        
+        # Sample batch
+        neg_obs, neg_acts, union_obs, union_acts, union_rewards = sample_trajectory_batch(
+            dataset_splits, args.batch_size, config['train_horizon'], device
+        )
+        
+        # Algorithm Step 2: Compute weights w*(s,a) for D^U using current energy model
+        weights = compute_energy_weights(energy_model, union_obs, union_acts)
+        
+        # Algorithm Step 4: Update flow network ν_φ with energy-weighted flow matching
+        flow_loss = train_energy_weighted_flow(
+            flow_model, flow_optimizer,
+            union_obs, union_acts, weights,  # Pass computed weights, not energy_model
+            args, config
+        )
+        
+        # Update progress bar
+        pbar.set_postfix({'F_loss': f'{flow_loss:.4f}'})
+        
+        # Evaluation
+        if args.use_eval and steps % args.eval_freq == 0:
+            eval_start_time = time.time()
+            for eval_id in range(config['eval_episode_freq']):
+                eval_reward, eval_cost, eval_len = evaluate_policy(
+                    eval_env, flow_model, device, norm_fn, args.diffusion_steps
+                )
+                eval_rew_deque.append(eval_reward)
+                eval_cost_deque.append(eval_cost)
+                eval_len_deque.append(eval_len)
+            
+            mean_rew = np.mean(eval_rew_deque)
+            mean_cost = np.mean(eval_cost_deque)
+            print(f"\n[Eval @ {steps:,}] Reward: {mean_rew:.2f} | Cost: {mean_cost:.2f}")
+            
+            if mean_rew > max_reward:
+                max_reward = mean_rew
+                logger.torch_save(itr=steps, torch_saver_elements=flow_model, prefix="flow_best")
+        
+        # Logging
+        if steps % args.log_freq == 0:
+            logger.log_tabular("Train/GradUpdates", steps)
+            logger.log_tabular("Loss/Energy", 0.0)
+            logger.log_tabular("Loss/Flow", flow_loss)
+            logger.log_tabular("Norm/energy", get_params_norm(energy_model.parameters(), grads=False))
+            logger.log_tabular("Norm/flow", get_params_norm(flow_model.parameters(), grads=False))
+            
+            if args.use_eval and len(eval_rew_deque) > 0:
+                logger.log_tabular("Metrics/EvalEpRet", np.mean(eval_rew_deque))
+                logger.log_tabular("Metrics/EvalEpCost", np.mean(eval_cost_deque))
+                logger.log_tabular("Metrics/EvalEpLen", np.mean(eval_len_deque))
+            
+            elapsed = time.time() - start_time
+            logger.log_tabular("Time/GradUpdatesPerSec", steps / elapsed)
+            logger.log_tabular("Time/TotalMinutes", elapsed / 60)
+            logger.dump_tabular()
+        
+        # Checkpoint saving
+        if steps % args.save_freq == 0:
+            logger.torch_save(itr=steps, torch_saver_elements=energy_model, prefix="energy")
+            logger.torch_save(itr=steps, torch_saver_elements=flow_model, prefix="flow")
+    
+    print(f"\n✓ Phase 2 Complete: {flow_train_iterations:,} gradient updates | Loss: {flow_loss:.4f}")
+    
+    # Compute final totals
+    total_grad_updates = energy_pretrain_iterations + flow_train_iterations
+    
+
     
     # Final save (like SafeTD3)
+    total_grad_updates = energy_pretrain_iterations + flow_train_iterations
     print("\n" + "=" * 60)
     print("Training Complete!")
-    print(f"  Total env steps: {total_steps:,}")
-    print(f"  Total gradient updates: {gradient_updates:,}")
+    print(f"  Total gradient updates: {total_grad_updates:,}")
     print(f"  Total time: {(time.time() - start_time)/60:.1f} minutes")
     print("=" * 60)
     print("Saving final models...")
     
-    logger.torch_save(itr=env_steps, torch_saver_elements=energy_model, prefix="energy")
-    logger.torch_save(itr=env_steps, torch_saver_elements=flow_model, prefix="flow")
+    logger.torch_save(itr=total_grad_updates, torch_saver_elements=energy_model, prefix="energy")
+    logger.torch_save(itr=total_grad_updates, torch_saver_elements=flow_model, prefix="flow")
     # NOTE: Policy not trained yet, commented out
     # logger.torch_save(itr=env_steps, torch_saver_elements=policy_model, prefix="policy")
     

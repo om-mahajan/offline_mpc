@@ -1,2 +1,0 @@
-Train/EnvSteps,Train/GradientUpdates,Loss/Energy,Loss/Flow,Norm/energy,Norm/flow,Time/StepsPerSec,Time/TotalMinutes
-160000,125,1.155124545097351,0.0,13.009672273881733,374.85697211662773,3222.5555779477313,0.05171878735224406
