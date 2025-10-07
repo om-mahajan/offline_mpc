@@ -105,10 +105,6 @@ def evaluate_policy(eval_env, score_model, device, norm_fn, diffusion_steps=15):
 
 
 def prepare_fake_actions_for_q(score_model, union_obs, args):
-    """
-    Sample fake actions from diffusion model for Q-function training
-    Similar to SafeTD3's prepare_fake_actions but for union data only
-    """
     with torch.no_grad():
         score_model.eval()
         batch_size = union_obs.shape[0]
@@ -139,12 +135,7 @@ def prepare_fake_actions_for_q(score_model, union_obs, args):
 
 
 def pretrain_energy_function(energy_model, optimizer, neg_obs, neg_acts, union_obs, union_acts, args, config):
-    """
-    Algorithm Step 1: Pretrain energy function by optimizing:
-    η* = arg max E_{d_N}[log E_η(s,a)] + E_{d_U}[log(1 - E_η(s,a))]
-    
-    This is binary classification: negative (D^N) = 1, unlabeled (D^U) = 0
-    """
+   
     energy_model.train()
     
     # Flatten trajectories
@@ -178,12 +169,6 @@ def pretrain_energy_function(energy_model, optimizer, neg_obs, neg_acts, union_o
 
 
 def compute_energy_weights(energy_model, union_obs, union_acts):
-    """
-    Algorithm Step 2: Set the weights w*(s,a) for D^U by energy:
-    w*(s,a) = exp(E_η*(s,a)) / Σ_{(s',a')∈D^U} exp(E_η*(s',a'))
-    
-    Returns normalized weights for the batch
-    """
     with torch.no_grad():
         energy_model.eval()
         horizon, batch_size = union_obs.shape[0], union_obs.shape[1]
@@ -205,12 +190,6 @@ def compute_energy_weights(energy_model, union_obs, union_acts):
 
 
 def train_energy_weighted_flow(score_model, optimizer, union_obs, union_acts, weights, args, config):
-    """
-    Algorithm Step 4: Update flow network ν_φ by energy-weighted flow matching:
-    min_φ E_{(s,a)~D^U} [w*(s,a) · (ν_φ(t,x) - u_{t_0}(x,x_0))^2]
-    
-    This is the diffusion loss weighted by energy
-    """
     score_model.train()
     horizon, batch_size = union_obs.shape[0], union_obs.shape[1]
     flat_obs = union_obs.reshape(horizon * batch_size, -1)
@@ -246,12 +225,6 @@ def train_energy_weighted_flow(score_model, optimizer, union_obs, union_acts, we
 
 
 def train_weighted_policy(policy_model, optimizer, union_obs, union_acts, weights, args, config):
-    """
-    Algorithm Step 5: Update policy π_ψ by weighted behavior cloning on D^U:
-    min_ψ -E_{(s,a)~D^U} [w*(s,a) log π_ψ(a|s)]
-    
-    This is weighted negative log-likelihood (behavior cloning)
-    """
     policy_model.train()
     horizon, batch_size = union_obs.shape[0], union_obs.shape[1]
     flat_obs = union_obs.reshape(horizon * batch_size, -1)
@@ -352,7 +325,6 @@ class EnergyFunction(nn.Module):
 
 
 def main(args):
-    """Main training loop following SafeTD3 structure (step-based)"""
     # Set random seeds
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -380,16 +352,13 @@ def main(args):
     total_iterations = energy_pretrain_iterations + flow_train_iterations  # 1.5M total
     
     print("=" * 60)
-    print(f"TRAINING MODE: GRADIENT UPDATES (like SafeTD3/SafeDICE)")
     print(args)
     print("=" * 60)
-    print(f"Step Counting: 1 step = 1 gradient update (1 forward + 1 backward pass)")
     print(f"  Batch size: {args.batch_size} trajectories × {config['train_horizon']} timesteps")
     print(f"  Transitions per batch: {args.batch_size * config['train_horizon']}")
     print("=" * 60)
-    print(f"Training schedule (Algorithm 1):")
-    print(f"  Phase 1 - Energy Pretraining: {energy_pretrain_iterations:,} gradient updates")
-    print(f"  Phase 2 - Flow Training: {flow_train_iterations:,} gradient updates")
+    print(f"  Energy Pretraining: {energy_pretrain_iterations:,} gradient updates")
+    print(f"  Flow Training: {flow_train_iterations:,} gradient updates")
     print(f"  Total: {total_iterations:,} gradient updates")
     print(f"  Evaluation: Every {args.eval_freq:,} gradient updates (ONLY during flow training)")
     print(f"  Logging: Every {args.log_freq:,} gradient updates")
@@ -494,7 +463,7 @@ def main(args):
     start_time = time.time()
     
     # ==================== PHASE 1: ENERGY PRETRAINING ====================
-    print(f"\nPHASE 1: Energy Pretraining ({energy_pretrain_iterations:,} gradient updates)")
+    print(f"\nEnergy Pretraining ({energy_pretrain_iterations:,} gradient updates)")
     print("=" * 60)
     
     pbar = tqdm(range(energy_pretrain_iterations), desc="Phase 1: Energy", unit="grad", dynamic_ncols=True)
@@ -533,10 +502,10 @@ def main(args):
             logger.torch_save(itr=steps, torch_saver_elements=energy_model, prefix="energy")
             logger.torch_save(itr=steps, torch_saver_elements=flow_model, prefix="flow")
     
-    print(f"\n✓ Phase 1 Complete: {energy_pretrain_iterations:,} gradient updates | Loss: {energy_loss:.4f}")
+    print(f"\nenergy func training done: {energy_pretrain_iterations:,} gradient updates | Loss: {energy_loss:.4f}")
     
     # ==================== PHASE 2: FLOW TRAINING ====================
-    print(f"\nPHASE 2: Flow Training ({flow_train_iterations:,} gradient updates)")
+    print(f"\nFlow Training ({flow_train_iterations:,} gradient updates)")
     print("=" * 60)
     
     pbar = tqdm(range(flow_train_iterations), desc="Phase 2: Flow", unit="grad", dynamic_ncols=True)
@@ -603,7 +572,7 @@ def main(args):
             logger.torch_save(itr=steps, torch_saver_elements=energy_model, prefix="energy")
             logger.torch_save(itr=steps, torch_saver_elements=flow_model, prefix="flow")
     
-    print(f"\n✓ Phase 2 Complete: {flow_train_iterations:,} gradient updates | Loss: {flow_loss:.4f}")
+    print(f"\nPhase 2 Complete: {flow_train_iterations:,} gradient updates | Loss: {flow_loss:.4f}")
     
     # Compute final totals
     total_grad_updates = energy_pretrain_iterations + flow_train_iterations
@@ -630,7 +599,7 @@ def main(args):
             state_dict={"mu_obs": mu_obs, "std_obs": std_obs}, dirname="norm"
         )
     
-    print("✓ All models saved successfully!")
+    print("All models saved successfully!")
     logger.close()
 
 
