@@ -1,6 +1,5 @@
 """
 Energy-Weighted Flow Matching for DSRL Safe Imitation Learning
-Following SafeTD3 structure with negative/union trajectory splits
 """
 import os
 import os.path as osp
