@@ -52,8 +52,8 @@ default_cfg = {
     "update_tau": 0.005,
     "train_horizon": 5,
     "weight_decay": 0.01,
-    "energy_pretrain_iterations": int(5e5),  # 500K gradient updates for energy
-    "flow_train_iterations": int(1e6),       # 1M gradient updates for flow
+    "energy_pretrain_iterations": int(5e3),  # 500K gradient updates for energy
+    "flow_train_iterations": int(1e4),       # 1M gradient updates for flow
     # Algorithm stages (using gradient updates like SafeTD3):
     # 1. Pretrain energy function (discriminate D^N vs D^U): 500K gradient updates
     # 2. Energy-weighted flow matching: 1M gradient updates
@@ -62,10 +62,21 @@ default_cfg = {
 
 
 def normalize_observation(mu_obs, std_obs, obs):
-    """Normalize observation using mean and std"""
+    """Normalize observation using mean and std - handles both numpy and torch tensors"""
     if mu_obs is None:
         return obs
-    return (obs - mu_obs) / (std_obs + EP)
+    
+    # Handle torch tensors
+    if isinstance(obs, torch.Tensor):
+        mu = mu_obs.to(obs.device) if isinstance(mu_obs, torch.Tensor) else torch.tensor(mu_obs, device=obs.device, dtype=obs.dtype)
+        std = std_obs.to(obs.device) if isinstance(std_obs, torch.Tensor) else torch.tensor(std_obs, device=obs.device, dtype=obs.dtype)
+        return (obs - mu) / (std + EP)
+    
+    # Handle numpy arrays
+    else:
+        mu = mu_obs.cpu().numpy() if isinstance(mu_obs, torch.Tensor) else mu_obs
+        std = std_obs.cpu().numpy() if isinstance(std_obs, torch.Tensor) else std_obs
+        return (obs - mu) / (std + EP)
 
 
 @torch.no_grad()
@@ -261,10 +272,13 @@ def train_weighted_policy(policy_model, optimizer, union_obs, union_acts, weight
 # Now using the algorithm from the paper directly
 
 
-def sample_trajectory_batch(dataset_splits, batch_size, train_horizon, device):
+def sample_trajectory_batch(dataset_splits, batch_size, train_horizon, device, norm_fn=None):
     """
     Sample trajectory batches from negative and union sets
     Returns: (neg_obs, neg_acts, union_obs, union_acts, union_rewards)
+    
+    Args:
+        norm_fn: Optional normalization function to apply to observations
     """
     neg_data = dataset_splits['negative']
     union_data = dataset_splits['union']
@@ -296,13 +310,19 @@ def sample_trajectory_batch(dataset_splits, batch_size, train_horizon, device):
         union_acts_batch.append(union_data['actions'][union_idx, union_start:union_start+train_horizon])
         union_rew_batch.append(union_data['rewards'][union_idx, union_start:union_start+train_horizon])
     
-    return (
-        torch.stack(neg_obs_batch).transpose(0, 1).to(device),  # [horizon, batch, dim]
-        torch.stack(neg_acts_batch).transpose(0, 1).to(device),
-        torch.stack(union_obs_batch).transpose(0, 1).to(device),
-        torch.stack(union_acts_batch).transpose(0, 1).to(device),
-        torch.stack(union_rew_batch).transpose(0, 1).to(device)
-    )
+    # Stack and transpose to [horizon, batch, dim]
+    neg_obs = torch.stack(neg_obs_batch).transpose(0, 1).to(device)
+    neg_acts = torch.stack(neg_acts_batch).transpose(0, 1).to(device)
+    union_obs = torch.stack(union_obs_batch).transpose(0, 1).to(device)
+    union_acts = torch.stack(union_acts_batch).transpose(0, 1).to(device)
+    union_rew = torch.stack(union_rew_batch).transpose(0, 1).to(device)
+    
+    # Apply normalization if provided
+    if norm_fn is not None:
+        neg_obs = norm_fn(neg_obs)
+        union_obs = norm_fn(union_obs)
+    
+    return (neg_obs, neg_acts, union_obs, union_acts, union_rew)
 
 
 # Energy function E_η (for discriminating D^N vs D^U)
@@ -469,9 +489,10 @@ def main(args):
     for grad_update in pbar:
         steps = grad_update + 1  # 1-indexed for logging
         
-        # Sample batch
+        # Sample batch (with normalization if enabled)
         neg_obs, neg_acts, union_obs, union_acts, union_rewards = sample_trajectory_batch(
-            dataset_splits, args.batch_size, config['train_horizon'], device
+            dataset_splits, args.batch_size, config['train_horizon'], device,
+            norm_fn if config["normalize_observation"] else None
         )
         
         # Energy pretraining: discriminate negative vs union
@@ -491,6 +512,13 @@ def main(args):
             logger.log_tabular("Loss/Flow", 0.0)
             logger.log_tabular("Norm/energy", get_params_norm(energy_model.parameters(), grads=False))
             logger.log_tabular("Norm/flow", get_params_norm(flow_model.parameters(), grads=False))
+            
+            # Always log eval metrics (even if not available yet) to maintain consistent headers
+            if args.use_eval:
+                logger.log_tabular("Metrics/EvalEpRet", np.nan)
+                logger.log_tabular("Metrics/EvalEpCost", np.nan)
+                logger.log_tabular("Metrics/EvalEpLen", np.nan)
+            
             elapsed = time.time() - start_time
             logger.log_tabular("Time/GradUpdatesPerSec", steps / elapsed)
             logger.log_tabular("Time/TotalMinutes", elapsed / 60)
@@ -511,9 +539,10 @@ def main(args):
     for grad_update in pbar:
         steps = energy_pretrain_iterations + grad_update + 1  # Continue counting from Phase 1
         
-        # Sample batch
+        # Sample batch (with normalization if enabled)
         neg_obs, neg_acts, union_obs, union_acts, union_rewards = sample_trajectory_batch(
-            dataset_splits, args.batch_size, config['train_horizon'], device
+            dataset_splits, args.batch_size, config['train_horizon'], device,
+            norm_fn if config["normalize_observation"] else None
         )
         
         # Algorithm Step 2: Compute weights w*(s,a) for D^U using current energy model
@@ -556,10 +585,16 @@ def main(args):
             logger.log_tabular("Norm/energy", get_params_norm(energy_model.parameters(), grads=False))
             logger.log_tabular("Norm/flow", get_params_norm(flow_model.parameters(), grads=False))
             
-            if args.use_eval and len(eval_rew_deque) > 0:
-                logger.log_tabular("Metrics/EvalEpRet", np.mean(eval_rew_deque))
-                logger.log_tabular("Metrics/EvalEpCost", np.mean(eval_cost_deque))
-                logger.log_tabular("Metrics/EvalEpLen", np.mean(eval_len_deque))
+            # Always log eval metrics to maintain consistent headers
+            if args.use_eval:
+                if len(eval_rew_deque) > 0:
+                    logger.log_tabular("Metrics/EvalEpRet", np.mean(eval_rew_deque))
+                    logger.log_tabular("Metrics/EvalEpCost", np.mean(eval_cost_deque))
+                    logger.log_tabular("Metrics/EvalEpLen", np.mean(eval_len_deque))
+                else:
+                    logger.log_tabular("Metrics/EvalEpRet", np.nan)
+                    logger.log_tabular("Metrics/EvalEpCost", np.nan)
+                    logger.log_tabular("Metrics/EvalEpLen", np.nan)
             
             elapsed = time.time() - start_time
             logger.log_tabular("Time/GradUpdatesPerSec", steps / elapsed)
