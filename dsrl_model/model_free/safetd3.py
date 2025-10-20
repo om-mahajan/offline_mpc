@@ -33,7 +33,7 @@ from dsrl_model.utils.models import (
     EnsembleValue,
     ExpCostModel,
     SafeDiceTanhMixtureActor,
-    SafeTransformerCritic,
+    SafeTransformerCritic,                                                              
     TdmpcCostModel,
     TdmpcDynamics,
 )

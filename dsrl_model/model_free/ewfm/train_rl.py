@@ -1,33 +1,23 @@
 import os
-import os.path as osp
-import sys
-import random
-import re
-import time
+import gym
+import d4rl
+import scipy
+import tqdm
 import functools
-from collections import deque
-from copy import deepcopy
-
+import time
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import Adam
-from torch.nn.utils.clip_grad import clip_grad_norm_
+from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-import tqdm
-
-import dsrl
-import dsrl.infos as dsrl_infos
-import safety_gymnasium
 
 from diffusion_SDE.loss import loss_fn as loss_fn
 from diffusion_SDE.schedule import marginal_prob_std
 from diffusion_SDE.model import ScoreNet, QGPO_Critic, update_target
-from utils import get_args
-from dsrl_adapter import DSRLSafetyDataset
-
-EP = 1e-6
+from utils import get_args, pallaral_eval_policy
+from dataset.dataset import D4RL_dataset
 
 def prepare_fake_actions(score_model, dataset, args, sample_batch_size=32768, bs2=256, nw=6):
     with torch.no_grad():
@@ -162,44 +152,6 @@ def train(args, score_model, q_model, dataset, start_epoch=0, score_model_target
     print("best rewards:",max_reward,"+-",max_std)
 
 
-def eval_dsrl_policy(policy_fn, env_name, seed, eval_episodes=20, diffusion_steps=15):
-    """Evaluate policy on DSRL safety environments, tracking both returns and costs"""
-    eval_envs = []
-    for i in range(eval_episodes):
-        env = safety_gymnasium.make(env_name)
-        eval_envs.append(env)
-        env.seed(seed + 1001 + i)
-        env.buffer_state = env.reset()
-        env.buffer_return = 0.0
-        env.buffer_cost = 0.0
-    ori_eval_envs = [env for env in eval_envs]
-    
-    while len(eval_envs) > 0:
-        new_eval_envs = []
-        states = np.stack([env.buffer_state for env in eval_envs])
-        actions = policy_fn(states, diffusion_steps=diffusion_steps)
-        for i, env in enumerate(eval_envs):
-            state, reward, done, info = env.step(actions[i])
-            env.buffer_return += reward
-            env.buffer_cost += info.get('cost', 0)
-            env.buffer_state = state
-            if not done:
-                new_eval_envs.append(env)
-        eval_envs = new_eval_envs
-    
-    returns = [ori_eval_envs[i].buffer_return for i in range(eval_episodes)]
-    costs = [ori_eval_envs[i].buffer_cost for i in range(eval_episodes)]
-    print(f"Returns: {returns}")
-    print(f"Costs: {costs}")
-    mean_return = np.mean(returns)
-    std_return = np.std(returns)
-    mean_cost = np.mean(costs)
-    std_cost = np.std(costs)
-    print(f"Reward: {mean_return:.2f} +- {std_return:.2f}")
-    print(f"Cost: {mean_cost:.2f} +- {std_cost:.2f}")
-    return ori_eval_envs
-
-
 def main(args):
     # The diffusion behavior training pipeline is copied directly from https://github.com/ChenDRAG/SfBC/blob/master/train_behavior.py
     for dir in ["./models_rl", "./logs"]:
@@ -213,92 +165,29 @@ def main(args):
         os.makedirs(os.path.join("./logs", "OT"))
     writer = SummaryWriter("./logs/" + str(args.expid))
     
-    # Check if using DSRL dataset
-    use_dsrl = args.use_dsrl or 'Gymnasium' in args.env
+    env = gym.make(args.env)
+    env.seed(args.seed)
+    env.action_space.seed(args.seed)
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    args.eval_func = functools.partial(pallaral_eval_policy, env_name=args.env, seed=args.seed, eval_episodes=args.seed_per_evaluation, diffusion_steps=args.diffusion_steps)
+    state_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.shape[0]
+    max_action = float(env.action_space.high[0])
+    args.writer = writer
     
-    if use_dsrl:
-        # Use DSRL safety environments
-        env = safety_gymnasium.make(args.env)
-        env.seed(args.seed)
-        env.action_space.seed(args.seed)
-        torch.manual_seed(args.seed)
-        np.random.seed(args.seed)
-        args.eval_func = functools.partial(eval_dsrl_policy, env_name=args.env, seed=args.seed, 
-                                          eval_episodes=args.seed_per_evaluation, diffusion_steps=args.diffusion_steps)
-        state_dim = env.observation_space.shape[0]
-        action_dim = env.action_space.shape[0]
-        max_action = float(env.action_space.high[0])
-        args.writer = writer
-        
-        marginal_prob_std_fn = functools.partial(marginal_prob_std, schedule = args.schedule, device=args.device)
-        args.marginal_prob_std_fn = marginal_prob_std_fn
-        score_model= ScoreNet(input_dim=state_dim+action_dim, output_dim=action_dim, marginal_prob_std=marginal_prob_std_fn, args=args).to(args.device)
-        score_model_target= ScoreNet(input_dim=state_dim+action_dim, output_dim=action_dim, marginal_prob_std=marginal_prob_std_fn, args=args).to(args.device)
-        score_model_target.eval()
-        for p in score_model_target.parameters():
-            p.requires_grad_(False)
-        q_model = QGPO_Critic(adim=action_dim, sdim=state_dim, args=args).to(args.device)
-        
-        # Create DSRL dataset adapter
-        print(f"Loading DSRL dataset with reward_quantile={args.reward_quantile}, cost_quantile={args.cost_quantile}")
-        dsrl_dataset = DSRLSafetyDataset(
-            env_name=args.env,
-            reward_quantile=args.reward_quantile,
-            cost_quantile=args.cost_quantile,
-            device=args.device
-        )
-        
-        # Create wrapper to match D4RL_dataset interface
-        class DSRLDatasetWrapper:
-            def __init__(self, dsrl_dataset):
-                self.dsrl_dataset = dsrl_dataset
-                self.states = dsrl_dataset.observations
-                self.next_states = dsrl_dataset.observations  # For next states, we'll use the same
-                self.actions = dsrl_dataset.actions
-                
-            def __len__(self):
-                return len(self.dsrl_dataset)
-            
-            def __getitem__(self, idx):
-                item = self.dsrl_dataset[idx]
-                return {
-                    's': item['observations'],
-                    'a': item['actions'],
-                    'r': item['rewards'],
-                    'd': torch.zeros_like(item['rewards']),  # Terminal flag (approximate)
-                    's_': item['observations'],  # Next state (approximate)
-                }
-        
-        dataset = DSRLDatasetWrapper(dsrl_dataset)
-        # since these S are frequently used, we store them in the dataset
-        dataset.S = torch.stack([dataset.states[:]] * args.M, dim=1)
-        print("training behavior on DSRL dataset")
-    else:
-        # Original D4RL path
-        env = gym.make(args.env)
-        env.seed(args.seed)
-        env.action_space.seed(args.seed)
-        torch.manual_seed(args.seed)
-        np.random.seed(args.seed)
-        args.eval_func = functools.partial(pallaral_eval_policy, env_name=args.env, seed=args.seed, eval_episodes=args.seed_per_evaluation, diffusion_steps=args.diffusion_steps)
-        state_dim = env.observation_space.shape[0]
-        action_dim = env.action_space.shape[0]
-        max_action = float(env.action_space.high[0])
-        args.writer = writer
-        
-        marginal_prob_std_fn = functools.partial(marginal_prob_std, schedule = args.schedule, device=args.device)
-        args.marginal_prob_std_fn = marginal_prob_std_fn
-        score_model= ScoreNet(input_dim=state_dim+action_dim, output_dim=action_dim, marginal_prob_std=marginal_prob_std_fn, args=args).to(args.device)
-        score_model_target= ScoreNet(input_dim=state_dim+action_dim, output_dim=action_dim, marginal_prob_std=marginal_prob_std_fn, args=args).to(args.device)
-        score_model_target.eval()
-        for p in score_model_target.parameters():
-            p.requires_grad_(False)
-        q_model = QGPO_Critic(adim=action_dim, sdim=state_dim, args=args).to(args.device)
-        dataset = D4RL_dataset(args)
-        # since these S are frequently used, we store them in the dataset
-        dataset.S = torch.stack([dataset.states[:]] * args.M, dim=1)
-        print("training behavior")
-    
+    marginal_prob_std_fn = functools.partial(marginal_prob_std, schedule = args.schedule, device=args.device)
+    args.marginal_prob_std_fn = marginal_prob_std_fn
+    score_model= ScoreNet(input_dim=state_dim+action_dim, output_dim=action_dim, marginal_prob_std=marginal_prob_std_fn, args=args).to(args.device)
+    score_model_target= ScoreNet(input_dim=state_dim+action_dim, output_dim=action_dim, marginal_prob_std=marginal_prob_std_fn, args=args).to(args.device)
+    score_model_target.eval()
+    for p in score_model_target.parameters():
+        p.requires_grad_(False)
+    q_model = QGPO_Critic(adim=action_dim, sdim=state_dim, args=args).to(args.device)
+    dataset = D4RL_dataset(args)
+    # since these S are frequently used, we store them in the dataset
+    dataset.S = torch.stack([dataset.states[:]] * args.M, dim=1)
+    print("training behavior")
     train(args, score_model, q_model, dataset, start_epoch=0, score_model_target=score_model_target)
     print("finished")
 
@@ -308,7 +197,7 @@ if __name__ == "__main__":
     import datetime 
     now = datetime.datetime.now()
     print(now)
-    print(args.env,args.alpha)
+    print(args.task,args.alpha)
     args.seed_per_evaluation = 100
     
     

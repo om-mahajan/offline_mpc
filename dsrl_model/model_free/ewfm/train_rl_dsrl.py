@@ -50,13 +50,11 @@ default_cfg = {
     "gamma": 0.99,
     "action_repeat": 1,
     "update_tau": 0.005,
-    "train_horizon": 5,
+    "train_horizon": 100 ,
     "weight_decay": 0.01,
-    "energy_pretrain_iterations": int(5e3),  # 500K gradient updates for energy
-    "flow_train_iterations": int(1e4),       # 1M gradient updates for flow
-    # Algorithm stages (using gradient updates like SafeTD3):
-    # 1. Pretrain energy function (discriminate D^N vs D^U): 500K gradient updates
-    # 2. Energy-weighted flow matching: 1M gradient updates
+    "energy_pretrain_iterations": int(1e5),  # 500K gradient updates for energy
+    "flow_train_iterations": int(5e5),       # 1M gradient updates for flow
+
     "evaluation_interval": 5,
 }
 
@@ -324,9 +322,6 @@ def sample_trajectory_batch(dataset_splits, batch_size, train_horizon, device, n
     
     return (neg_obs, neg_acts, union_obs, union_acts, union_rew)
 
-
-# Energy function E_η (for discriminating D^N vs D^U)
-# Simple MLP that outputs logits for binary classification
 class EnergyFunction(nn.Module):
     def __init__(self, input_dim, hidden_sizes=[256, 256]):
         super().__init__()
@@ -385,8 +380,17 @@ def main(args):
     print("=" * 60)
     
     # Create directories and setup logger (following SafeTD3 style)
-    if not os.path.exists(os.path.join("./models_rl", str(args.expid))):
-        os.makedirs(os.path.join("./models_rl", str(args.expid)))
+    models_dir = os.path.join("./models_rl", str(args.expid))
+    if not os.path.exists(models_dir):
+        os.makedirs(models_dir)
+    
+    print("=" * 60)
+    print("SAVE LOCATIONS:")
+    print(f"  Models directory: {os.path.abspath(models_dir)}")
+    print(f"  Logs directory: {os.path.abspath(args.log_dir)}")
+    print(f"  Experiment ID: {args.expid}")
+    print(f"  First checkpoint at: {args.save_freq:,} gradient updates")
+    print("=" * 60)
     
     # Setup logger (like SafeTD3)
     dict_args = vars(args)
@@ -395,6 +399,7 @@ def main(args):
         seed=str(args.seed),
     )
     logger.save_config(dict_args)
+    print(f"Logger initialized at: {os.path.abspath(args.log_dir)}")
     
     # Setup environment (DSRL environments registered via dsrl.offline_safety_gymnasium import)
     eval_env = gym.make(args.task)
@@ -526,10 +531,12 @@ def main(args):
         
         # Checkpoint saving
         if steps % args.save_freq == 0:
+            print(f"\n[Phase 1 Checkpoint] Saving models at step {steps:,}...")
             logger.torch_save(itr=steps, torch_saver_elements=energy_model, prefix="energy")
             logger.torch_save(itr=steps, torch_saver_elements=flow_model, prefix="flow")
+            print(f"Models saved to: {os.path.abspath(logger.log_dir)}")
     
-    print(f"\nenergy func training done: {energy_pretrain_iterations:,} gradient updates | Loss: {energy_loss:.4f}")
+    print(f"\nPhase 1 Complete: Energy pretraining done ({energy_pretrain_iterations:,} gradient updates) | Loss: {energy_loss:.4f}")
     
     # ==================== PHASE 2: FLOW TRAINING ====================
     print(f"\nFlow Training ({flow_train_iterations:,} gradient updates)")
@@ -603,10 +610,12 @@ def main(args):
         
         # Checkpoint saving
         if steps % args.save_freq == 0:
+            print(f"\n[Phase 2 Checkpoint] Saving models at step {steps:,}...")
             logger.torch_save(itr=steps, torch_saver_elements=energy_model, prefix="energy")
             logger.torch_save(itr=steps, torch_saver_elements=flow_model, prefix="flow")
+            print(f"  ✓ Models saved to: {os.path.abspath(logger.log_dir)}")
     
-    print(f"\nPhase 2 Complete: {flow_train_iterations:,} gradient updates | Loss: {flow_loss:.4f}")
+    print(f"\n✓ Phase 2 Complete: Flow training done ({flow_train_iterations:,} gradient updates) | Loss: {flow_loss:.4f}")
     
     # Compute final totals
     total_grad_updates = energy_pretrain_iterations + flow_train_iterations
@@ -616,11 +625,11 @@ def main(args):
     # Final save (like SafeTD3)
     total_grad_updates = energy_pretrain_iterations + flow_train_iterations
     print("\n" + "=" * 60)
-    print("Training Complete!")
+    print("TRAINING COMPLETE!")
     print(f"  Total gradient updates: {total_grad_updates:,}")
     print(f"  Total time: {(time.time() - start_time)/60:.1f} minutes")
     print("=" * 60)
-    print("Saving final models...")
+    print("\n[Final Save] Saving final models...")
     
     logger.torch_save(itr=total_grad_updates, torch_saver_elements=energy_model, prefix="energy")
     logger.torch_save(itr=total_grad_updates, torch_saver_elements=flow_model, prefix="flow")
@@ -632,8 +641,13 @@ def main(args):
         logger.save_state(
             state_dict={"mu_obs": mu_obs, "std_obs": std_obs}, dirname="norm"
         )
+        print(f"  ✓ Normalization stats saved")
     
-    print("All models saved successfully!")
+    print(f"\n✅ All models saved successfully!")
+    print(f"📁 Models location: {os.path.abspath(logger.log_dir)}")
+    print(f"📊 Logs location: {os.path.abspath(logger.log_dir)}")
+    print(f"📈 View progress: cat {os.path.join(logger.log_dir, 'progress.txt')}")
+    print("=" * 60)
     logger.close()
 
 
