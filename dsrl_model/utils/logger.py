@@ -142,9 +142,18 @@ class Logger:
         self.first_row = True
         self.log_headers = []
         self.log_current_row = {}
-        self.exp_name = "-".join(
-            [log_dir.split("/")[-3], log_dir.split("/")[-2], "seed", seed]
-        )
+        
+        # Handle variable-length paths (cross-platform compatible)
+        path_parts = log_dir.replace("\\", "/").split("/")
+        name_parts = []
+        if len(path_parts) >= 3:
+            name_parts = [path_parts[-3], path_parts[-2], "seed", str(seed)]
+        elif len(path_parts) >= 2:
+            name_parts = [path_parts[-2], "seed", str(seed)]
+        else:
+            name_parts = ["experiment", "seed", str(seed)]
+        self.exp_name = "-".join(name_parts)
+        
         self.torch_saver_elements = None
         self.use_tensorboard = use_tensorboard
         self.logged = True

@@ -8,22 +8,27 @@ import dsrl.offline_safety_gymnasium  # Registers DSRL envs
 class DSRLSafetyDataset(Dataset):
     """
     Dataset adapter for DSRL offline safety datasets.
-    Filters trajectories based on reward and cost:
-    - Keep only high-reward trajectories (>= 50% max return)
-    - Negative set: high-cost trajectories
-    - Union set: remaining high-reward trajectories
+    Filters trajectories based on reward and cost quantiles to focus on
+    high-reward, low-cost demonstrations for safe imitation learning.
     """
     
-    def __init__(self, env_name, num_negative=50, horizon=100, device='cpu', high_reward_ratio=0.5):
+    def __init__(self, env_name, num_negative=50, horizon=100, device='cpu'):
+        """
+        Args:
+            env_name: DSRL environment name (e.g., 'OfflinePointGoal1Gymnasium-v0')
+            num_negative: Number of non-preferred (negative) trajectories to select (by cost)
+            horizon: Fixed length for each trajectory (truncate or pad)
+            device: torch device for tensors
+        """
         self.env_name = env_name
         self.device = device
-        self.high_reward_ratio = high_reward_ratio
-        
+        # Load DSRL dataset
         print(f"Loading DSRL dataset: {env_name}")
+        # Create env and load dataset (following DSRL API)
         env = gym.make(env_name)
         dataset = env.get_dataset()
 
-        # Extract trajectory info
+        # Extract trajectory information
         observations = dataset['observations']
         actions = dataset['actions']
         rewards = dataset['rewards']
@@ -49,22 +54,15 @@ class DSRLSafetyDataset(Dataset):
 
         print(f"Total trajectories: {len(trajectories)}")
 
-        # Keep only high-reward trajectories
-        max_return = max(traj['return'] for traj in trajectories)
-        reward_threshold = self.high_reward_ratio * max_return
-        high_reward_trajs = [traj for traj in trajectories if traj['return'] >= reward_threshold]
-
-        print(f"High-reward trajectories (>= {self.high_reward_ratio*100:.0f}% max): {len(high_reward_trajs)}")
-
-        # Sort by cost
-        sorted_trajs = sorted(high_reward_trajs, key=lambda x: x['cost_sum'], reverse=True)
+        # Sort trajectories by cost (descending: worst first)
+        sorted_trajs = sorted(trajectories, key=lambda x: x['cost_sum'], reverse=True)
         negative_trajs = sorted_trajs[:num_negative]
         union_trajs = sorted_trajs[num_negative:]
 
-        print(f"Negative (non-preferred, high-cost) trajectories: {len(negative_trajs)}")
-        print(f"Union (high-reward) trajectories: {len(union_trajs)}")
+        print(f"Negative (non-preferred) trajectories: {len(negative_trajs)}")
+        print(f"Union (unlabeled/preferred) trajectories: {len(union_trajs)}")
 
-        # Helper to pad/truncate trajectories
+        # Helper to pad/truncate trajectories to fixed horizon
         def fix_horizon(traj, horizon):
             obs = traj['observations']
             act = traj['actions']
@@ -95,7 +93,7 @@ class DSRLSafetyDataset(Dataset):
         self.negative = [fix_horizon(traj, horizon) for traj in negative_trajs]
         self.union = [fix_horizon(traj, horizon) for traj in union_trajs]
 
-        # Stack into tensors
+        # Stack into arrays: shape [num_traj, horizon, dim]
         self.negative_obs = torch.FloatTensor(np.stack([traj['observations'] for traj in self.negative])).to(device)
         self.negative_act = torch.FloatTensor(np.stack([traj['actions'] for traj in self.negative])).to(device)
         self.negative_rew = torch.FloatTensor(np.stack([traj['rewards'] for traj in self.negative])).to(device)
@@ -135,9 +133,11 @@ class DSRLSafetyDataset(Dataset):
         }
     
     def __len__(self):
+        """Return total number of trajectories"""
         return len(self.negative) + len(self.union)
     
     def __getitem__(self, idx):
+        """Get a single trajectory (negative or union)"""
         if idx < len(self.negative):
             return {
                 'observations': self.negative_obs[idx],

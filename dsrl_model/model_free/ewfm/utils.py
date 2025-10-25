@@ -5,6 +5,10 @@ import torch
 from tensorboard.backend.event_processing import event_accumulator
 
 def get_args():
+    """
+    Argument parser for energy-based flow matching (EWFM) methods.
+    Compatible with both pubc (3-stage training) and difdice (2-phase training) scripts.
+    """
     parser = argparse.ArgumentParser()
     # Environment and experiment
     parser.add_argument("--task", "--env", dest="task", default="OfflinePointGoal1Gymnasium-v0", 
@@ -23,32 +27,46 @@ def get_args():
                         help="Diffusion schedule")
     parser.add_argument('--K_renew', type=int, default=10, help="Frequency to renew fake actions")
     
-    # Dataset configuration (SafeTD3-style)
+    # Dataset configuration
     parser.add_argument('--num_non_preferred', '--num_negative', dest='num_non_preferred', 
                         type=int, default=50, help="Number of non-preferred (high-cost) trajectories")
     parser.add_argument('--num_union', type=int, default=-1, help="Number of union trajectories (-1 = all remaining)")
-    parser.add_argument('--train_horizon', type=int, default=5, help="Training horizon for trajectories")
+    parser.add_argument('--train_horizon', type=int, default=60, help="Training horizon for trajectories")
     parser.add_argument('--non_pref_noise', type=float, default=0.0, help="Noise for non-preferred selection")
     parser.add_argument('--normalize_observation', action='store_true', help="Normalize observations")
     
-    # Training hyperparameters (step-based, like SafeTD3)
+    # Training hyperparameters
     parser.add_argument('--batch_size', type=int, default=256, help="Batch size")
     parser.add_argument('--lr', type=float, default=3e-4, help="Learning rate")
     parser.add_argument('--total_iteration', type=int, default=int(1e6), 
-                        help="Total training steps (iterations). Default 1M like SafeTD3")
+                        help="Total training steps (iterations). Default 1M for pubc 3-stage training")
     parser.add_argument('--weight_decay', type=float, default=0.01, help="Weight decay")
     parser.add_argument('--max_grad_norm', type=float, default=1.0, help="Max gradient norm for clipping")
     
-    # Note: Training stages are automatically split as 60%/30%/10% of total_iteration
+    # DifdICE-specific arguments (2-phase training)
+    parser.add_argument('--cost_pretrain_iterations', type=int, default=50000,
+                        help="Phase 1: Cost model pretraining iterations (difdice only)")
+    parser.add_argument('--flow_train_iterations', type=int, default=10000,
+                        help="Phase 2: Flow and critic training iterations (difdice only)")
+    parser.add_argument('--gamma', type=float, default=0.99, 
+                        help="Discount factor for critic (difdice only)")
+    parser.add_argument('--grad_reg_coeffs_nu', type=float, default=1e-6,
+                        help="Gradient penalty coefficient for critic (difdice only)")
+    parser.add_argument('--cost_weight_temp', type=float, default=1.0,
+                        help="Temperature for advantage-based weighting (difdice only)")
+    
+    # Note: pubc uses 3-stage training automatically split as 60%/30%/10% of total_iteration
     # Stage 1 (BC): 600k steps (60% of 1M)
     # Stage 2 (Q): 300k steps (30% of 1M)  
     # Stage 3 (Energy): 100k steps (10% of 1M)
     
     # Evaluation
     parser.add_argument('--seed_per_evaluation', '--eval_episodes', dest='seed_per_evaluation', 
-                        type=int, default=10, help="Number of evaluation episodes")
-    parser.add_argument('--eval_freq', type=int, default=5000, help="Evaluation frequency (steps) - matches SafeTD3")
+                        type=int, default=3, help="Number of evaluation episodes")
+    parser.add_argument('--eval_freq', type=int, default=10000, help="Evaluation frequency (steps)")
     parser.add_argument('--use_eval', action='store_true', default=True, help="Enable evaluation")
+    parser.add_argument('--eval_episode_freq', type=int, default=3,
+                        help="Number of episodes per evaluation (difdice)")
     
     # Logging and saving
     parser.add_argument('--log_dir', type=str, default="./logs", help="Log directory")
@@ -66,9 +84,11 @@ def get_args():
     args = parser.parse_known_args()[0]
     
     if args.debug:
-        # Debug mode: reduce to 1000 steps (same as SafeTD3 debug)
+        # Debug mode: reduce to 1000 steps
         args.total_iteration = 1000
-        print("DEBUG MODE: Reduced to 1000 total steps")
+        args.cost_pretrain_iterations = 100
+        args.flow_train_iterations = 100
+        print("DEBUG MODE: Reduced iterations to 1000/100/100")
         
     if args.q_alpha is None:
         args.q_alpha = args.alpha
