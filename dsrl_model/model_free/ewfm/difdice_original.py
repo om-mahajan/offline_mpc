@@ -19,6 +19,7 @@ import os.path as osp
 import random
 import sys
 import time
+from pathlib import Path
 import functools
 from collections import deque
 from copy import deepcopy
@@ -32,6 +33,10 @@ from torch.autograd import Variable
 from torch.optim import Adam
 from torch.optim.lr_scheduler import LinearLR
 from tqdm import tqdm
+
+current_file = Path(__file__).resolve()
+offline_mpc_dir = current_file.parents[3]  # Go up 3 levels to reach offline_mpc
+sys.path.insert(0, str(offline_mpc_dir))
 
 # DSRL imports (assumes these packages/modules are installed/available)
 import gymnasium as gym
