@@ -64,13 +64,13 @@ default_cfg = {
     "weight_decay": 0.0,
     # Diffusion
     "diffusion_steps": 15,
-    "train_horizon": 60,
+    "train_horizon": 5,
     # SafeDICE / Safe training (Phase 2 only)
     "grad_reg_coeffs_nu": 1e-6,  # Gradient penalty for critic (nu function)
     "cost_weight_temp": 1.0,     # Temperature for advantage-based weighting
     # Iterations (defaults — override via CLI args)
-    "cost_pretrain_iterations": int(5e4),   # phase 1: NU learning for cost model
-    "flow_train_iterations": int(1e4),      # phase 2: critic + flow training
+    "cost_pretrain_iterations": int(5e5),   # phase 1: NU learning for cost model - 500,000
+    "flow_train_iterations": int(1e6),      # phase 2: critic + flow training - 1,000,000
     "batch_size": 256,
     "device": "cuda",
     "gamma": 0.99,  # Discount factor for critic
@@ -391,8 +391,10 @@ def main(args):
     relpath = time.strftime("%Y-%m-%d-%H-%M-%S")
     subfolder = "-".join(["seed", str(args.seed).zfill(3)])
     relpath = "-".join([subfolder, relpath])
-    algo = "safedice_flow_matching"
-    args.log_dir = os.path.join(args.log_dir, args.experiment, args.task, algo, relpath)
+    algo = "pubc_flow_matching"
+    # Use offline_mpc/logs as base directory
+    base_log_dir = os.path.join(str(offline_mpc_dir), "logs")
+    args.log_dir = os.path.join(base_log_dir, args.experiment, args.task, algo, relpath)
     if not os.path.exists(args.log_dir):
         os.makedirs(args.log_dir, exist_ok=True)
     
@@ -527,6 +529,18 @@ def main(args):
     critic_update_freq = config.get("critic_update_freq", 10)  # Update critic every N steps
     # Option to disable weighting for maximum speed (use uniform weights)
     use_energy_weighting = config.get("use_energy_weighting", True)
+    
+    # Initialize all logging keys with NaN values to avoid assertion errors
+    logger_phase2.log_tabular("Train/Step", 0)
+    logger_phase2.log_tabular("Train/Loss/Nu", float('nan'))
+    logger_phase2.log_tabular("Train/Loss/Flow", float('nan'))
+    logger_phase2.log_tabular("Train/Norm/Critic", float('nan'))
+    logger_phase2.log_tabular("Train/Norm/Flow", float('nan'))
+    logger_phase2.log_tabular("Time/ElapsedSec", 0.0)
+    logger_phase2.log_tabular("Eval/Reward", float('nan'))
+    logger_phase2.log_tabular("Eval/Cost", float('nan'))
+    logger_phase2.log_tabular("Eval/Length", float('nan'))
+    logger_phase2.dump_tabular()
 
     for step in pbar:
         # sample a batch (trajectories)
@@ -692,15 +706,15 @@ if __name__ == "__main__":
                         help="Training horizon (timesteps per trajectory)")
     
     # Phase 1: Cost model training (NU learning)
-    parser.add_argument("--cost_pretrain_iterations", type=int, default=50000, 
+    parser.add_argument("--cost_pretrain_iterations", type=int, default=500000, 
                         help="Phase 1: NU learning iterations for cost model")
     
     # Phase 2: Flow + critic training
-    parser.add_argument("--flow_train_iterations", type=int, default=10000, 
+    parser.add_argument("--flow_train_iterations", type=int, default=1000000, 
                         help="Phase 2: Flow and critic training iterations")
     
     # Optimization
-    parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
+    parser.add_argument("--lr", type=float, default=0.0001, help="Learning rate")
     parser.add_argument("--weight_decay", type=float, default=0.0, help="Weight decay")
     parser.add_argument("--max_grad_norm", type=float, default=1.0, 
                         help="Max gradient norm for clipping")
@@ -725,9 +739,9 @@ if __name__ == "__main__":
     # Evaluation
     parser.add_argument("--use_eval", action="store_true", default=True, 
                         help="Enable periodic evaluation")
-    parser.add_argument("--eval_freq", type=int, default=10000, 
+    parser.add_argument("--eval_freq", type=int, default=20000, 
                         help="Evaluation frequency (steps)")
-    parser.add_argument("--eval_episode_freq", type=int, default=5, 
+    parser.add_argument("--eval_episode_freq", type=int, default=3, 
                         help="Number of episodes per evaluation")
     
     # Logging frequency

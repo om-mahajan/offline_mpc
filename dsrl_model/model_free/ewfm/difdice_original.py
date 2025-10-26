@@ -68,11 +68,11 @@ default_cfg = {
     # Logging / checkpoint
     "log_freq": int(1e4),
     "save_freq": int(2e4),
-    "eval_episode_freq": 5,
+    "eval_episode_freq": 3,
     "hidden_sizes": [256, 256],
     "max_grad_norm": 1.0,
     # Optimization
-    "lr": 3e-4,
+    "lr": 0.0001,
     "weight_decay": 0.0,
     # Diffusion
     "diffusion_steps": 15,
@@ -83,8 +83,8 @@ default_cfg = {
     "cost_weight_temp": 1.0,
     "act_train_use_logprob": True,
     # Iterations (defaults — override via CLI args)
-    "cost_pretrain_iterations": int(5e4),   # phase 1
-    "flow_train_iterations": int(1e4),      # phase 2 total iterations
+    "cost_pretrain_iterations": int(5e5),   # phase 1: 500,000
+    "flow_train_iterations": int(1e6),      # phase 2: 1,000,000
     "batch_size": 64,
     "device": "cuda",
 }
@@ -437,8 +437,10 @@ def main(args):
     relpath = time.strftime("%Y-%m-%d-%H-%M-%S")
     subfolder = "-".join(["seed", str(args.seed).zfill(3)])
     relpath = "-".join([subfolder, relpath])
-    algo = "safedice_flow_matching"
-    args.log_dir = os.path.join(args.log_dir, args.experiment, args.task, algo, relpath)
+    algo = "safedice_flow_matching_dhiran"
+    # Use offline_mpc/logs as base directory
+    base_log_dir = os.path.join(str(offline_mpc_dir), "logs")
+    args.log_dir = os.path.join(base_log_dir, args.experiment, args.task, algo, relpath)
     if not os.path.exists(args.log_dir):
         os.makedirs(args.log_dir, exist_ok=True)
     logger = EpochLogger(log_dir=args.log_dir, seed=str(args.seed))
@@ -547,6 +549,9 @@ def main(args):
     logger.log(f"Found alpha: {alpha:.6f}")
     print(f"Alpha = {alpha:.6f}")
 
+    # Close Phase 1 logger
+    logger.close()
+    
     # Freeze cost model (use only for computing rewards)
     for p in cost_model.parameters():
         p.requires_grad = False
@@ -554,10 +559,27 @@ def main(args):
 
     # ============= PHASE 2: Train critic + flow with SafeDICE-derived weights ============
     print("\nPhase 2: Train critic + flow (weighted by critic advantage)")
+    
+    # Create NEW logger for Phase 2 (separate from Phase 1)
+    logger_phase2 = EpochLogger(log_dir=args.log_dir, seed=str(args.seed))
+    logger_phase2.save_config({**config, **vars(args)})
+    
     best_flow_reward = -float('inf')
     eval_deque = deque(maxlen=config["eval_episode_freq"])
     pbar = tqdm(range(flow_train_iters), desc="Phase2:Flow", unit="iter", dynamic_ncols=True)
     start_time = time.time()
+    
+    # Initialize all logging keys with NaN values to avoid assertion errors
+    logger_phase2.log_tabular("Train/Step", 0)
+    logger_phase2.log_tabular("Train/Loss/Nu", float('nan'))
+    logger_phase2.log_tabular("Train/Loss/Flow", float('nan'))
+    logger_phase2.log_tabular("Train/Norm/Critic", float('nan'))
+    logger_phase2.log_tabular("Train/Norm/Flow", float('nan'))
+    logger_phase2.log_tabular("Time/ElapsedSec", 0.0)
+    logger_phase2.log_tabular("Eval/Reward", float('nan'))
+    logger_phase2.log_tabular("Eval/Cost", float('nan'))
+    logger_phase2.log_tabular("Eval/Length", float('nan'))
+    logger_phase2.dump_tabular()
 
     for step in pbar:
         # sample a batch (trajectories)
@@ -625,18 +647,8 @@ def main(args):
         # Optional: update actor (BC) with same weights (not implemented by default)
         # If you want actor updates, compute weighted BC loss using union_obs/union_acts and weights and step actor optimizer.
 
-        # Logging and evaluation
-        if (step + 1) % config["log_freq"] == 0 or (step + 1) == flow_train_iters:
-            elapsed = time.time() - start_time
-            #logger.log_tabular("TrainStep", step+1)
-            #logger.log_tabular("Loss/Nu", nu_loss_value)
-            #logger.log_tabular("Loss/Flow", flow_loss_value)
-            #logger.log_tabular("Norm/Params/critic", get_params_norm(critic_model.parameters(), grads=False))
-            #logger.log_tabular("Norm/Params/flow", get_params_norm(flow_model.parameters(), grads=False))
-            #logger.log_tabular("TimeElapsedSec", elapsed)
-            #logger.dump_tabular()
-
         # Periodic eval of flow policy
+        eval_reward, eval_cost, eval_len = None, None, None
         if args.use_eval and ((step + 1) % (args.eval_freq or 1000) == 0):
             eval_reward, eval_cost, eval_len = 0.0, 0.0, 0
             # run a few episodes
@@ -646,23 +658,42 @@ def main(args):
             eval_reward /= config["eval_episode_freq"]
             eval_cost /= config["eval_episode_freq"]
             eval_len /= config["eval_episode_freq"]
-            logger.log(f"[Eval] Step {step+1}: reward={eval_reward:.2f} cost={eval_cost:.2f} len={eval_len:.2f}")
+            
+            # Print to console
+            logger_phase2.log(f"[Eval] Step {step+1}: reward={eval_reward:.2f} cost={eval_cost:.2f} len={eval_len:.2f}")
+            
             # save best flow by reward
             if eval_reward > best_flow_reward:
                 best_flow_reward = eval_reward
-                logger.torch_save(itr=step+1, torch_saver_elements=flow_model, prefix="flow_best")
+                logger_phase2.torch_save(itr=step+1, torch_saver_elements=flow_model, prefix="flow_best")
+
+        # Logging (always log all metrics, use current values or NaN for missing ones)
+        if (step + 1) % config["log_freq"] == 0 or (step + 1) == flow_train_iters:
+            elapsed = time.time() - start_time
+            # Training metrics (always available)
+            logger_phase2.log_tabular("Train/Step", step+1)
+            logger_phase2.log_tabular("Train/Loss/Nu", nu_loss_value)
+            logger_phase2.log_tabular("Train/Loss/Flow", flow_loss_value)
+            logger_phase2.log_tabular("Train/Norm/Critic", get_params_norm(critic_model.parameters(), grads=False))
+            logger_phase2.log_tabular("Train/Norm/Flow", get_params_norm(flow_model.parameters(), grads=False))
+            logger_phase2.log_tabular("Time/ElapsedSec", elapsed)
+            # Evaluation metrics (use NaN if eval hasn't run yet - works with CSV and TensorBoard)
+            logger_phase2.log_tabular("Eval/Reward", eval_reward if eval_reward is not None else float('nan'))
+            logger_phase2.log_tabular("Eval/Cost", eval_cost if eval_cost is not None else float('nan'))
+            logger_phase2.log_tabular("Eval/Length", eval_len if eval_len is not None else float('nan'))
+            logger_phase2.dump_tabular()
 
         # Checkpoint saving
         if (step + 1) % config["save_freq"] == 0 or (step + 1) == flow_train_iters:
-            logger.torch_save(itr=step+1, torch_saver_elements=flow_model, prefix="flow")
-            logger.torch_save(itr=step+1, torch_saver_elements=cost_model, prefix="cost")
-            logger.torch_save(itr=step+1, torch_saver_elements=critic_model, prefix="critic")
+            logger_phase2.torch_save(itr=step+1, torch_saver_elements=flow_model, prefix="flow")
+            logger_phase2.torch_save(itr=step+1, torch_saver_elements=cost_model, prefix="cost")
+            logger_phase2.torch_save(itr=step+1, torch_saver_elements=critic_model, prefix="critic")
 
     # Final saves
-    logger.torch_save(itr=flow_train_iters, torch_saver_elements=flow_model, prefix="flow")
-    logger.torch_save(itr=flow_train_iters, torch_saver_elements=cost_model, prefix="cost")
-    logger.torch_save(itr=flow_train_iters, torch_saver_elements=critic_model, prefix="critic")
-    logger.close()
+    logger_phase2.torch_save(itr=flow_train_iters, torch_saver_elements=flow_model, prefix="flow")
+    logger_phase2.torch_save(itr=flow_train_iters, torch_saver_elements=cost_model, prefix="cost")
+    logger_phase2.torch_save(itr=flow_train_iters, torch_saver_elements=critic_model, prefix="critic")
+    logger_phase2.close()
     print("Training complete.")
 
 
@@ -685,12 +716,12 @@ if __name__ == "__main__":
     parser.add_argument("--diffusion_steps", type=int, default=15)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--train_horizon", type=int, default=5)
-    parser.add_argument("--cost_pretrain_iterations", type=int, default=50000)
-    parser.add_argument("--flow_train_iterations", type=int, default=10000)
+    parser.add_argument("--cost_pretrain_iterations", type=int, default=500000)
+    parser.add_argument("--flow_train_iterations", type=int, default=1000000)
     parser.add_argument("--log_freq", type=int, default=1000)
     parser.add_argument("--save_freq", type=int, default=2000)
     parser.add_argument("--use_eval", action="store_true",default=True)
-    parser.add_argument("--eval_freq", type=int, default=2000)
+    parser.add_argument("--eval_freq", type=int, default=20000)
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
