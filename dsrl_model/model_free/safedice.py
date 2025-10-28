@@ -3,6 +3,7 @@ import os.path as osp
 import random
 import re
 import sys
+from pathlib import Path
 import time
 from collections import deque
 from copy import deepcopy
@@ -17,6 +18,10 @@ import torch.nn.functional as F
 from torch.autograd import Variable
 from torch.nn.utils.clip_grad import clip_grad_norm_
 from torch.optim.lr_scheduler import LinearLR
+
+current_file = Path(__file__).resolve()
+offline_mpc_dir = current_file.parents[2]  # Go up 2 levels to reach offline_mpc
+sys.path.insert(0, str(offline_mpc_dir))
 
 from dsrl_model.utils.bufffer import SafeDiceBuffer
 from dsrl_model.utils.dsrl_dataset import (
@@ -55,6 +60,7 @@ default_cfg = {
     "weight_decay_cost": 0.01,
     "cost_weight_temp": 1.0,
     "act_train_use_logprob": True,
+    "use_eval": True,
 }
 
 trajectory_cfg = {
@@ -257,6 +263,7 @@ def main(args, cfg_env=None):
     config["act_train_use_logprob"] = (
         args.act_train_use_logprob or config["act_train_use_logprob"]
     )
+    config["use_eval"] = args.use_eval or config.get("use_eval", True)
 
     # evaluation environment
     eval_env = gym.make(args.task)
@@ -467,40 +474,29 @@ def main(args, cfg_env=None):
             if (steps % config["log_freq"] == 0) and (not logger.logged):
                 # evaluate episodes
                 eval_episodes = 1
-                if args.use_eval:
-                    eval_start_time = time.time()
-                    for id in range(eval_episodes):
-                        eval_reward, eval_cost, eval_len, *_ = evaluate_bc_policy(
-                            eval_env=eval_env,
-                            bc_policy=actor,
-                            device=device,
-                        )
-                        norm_reward, norm_cost = eval_env.get_normalized_score(
-                            eval_reward, eval_cost
-                        )
-                        eval_norm_rew_deque.append(norm_reward)
-                        eval_norm_cost_deque.append(norm_cost)
-                        eval_rew_deque.append(eval_reward)
-                        eval_cost_deque.append(eval_cost)
-                        eval_len_deque.append(eval_len)
-                    logger.store(
-                        **{
-                            "Metrics/EvalEpRet": np.mean(eval_rew_deque),
-                            "Metrics/EvalEpCost": np.mean(eval_cost_deque),
-                            "Metrics/EvalEpNormRet": np.mean(eval_norm_rew_deque),
-                            "Metrics/EvalEpNormCost": np.mean(eval_norm_cost_deque),
-                            "Metrics/EvalEpLen": np.mean(eval_len_deque),
-                        }
+                eval_start_time = time.time()
+                for id in range(eval_episodes):
+                    eval_reward, eval_cost, eval_len, *_ = evaluate_bc_policy(
+                        eval_env=eval_env,
+                        bc_policy=actor,
+                        device=device,
                     )
-                    eval_end_time = time.time()
-
-                    logger.log_tabular("Metrics/EvalEpRet")
-                    logger.log_tabular("Metrics/EvalEpCost")
-                    logger.log_tabular("Metrics/EvalEpNormRet")
-                    logger.log_tabular("Metrics/EvalEpNormCost")
-                    logger.log_tabular("Metrics/EvalEpLen")
-                    logger.log_tabular("Time/Eval", eval_end_time - eval_start_time)
-
+                    norm_reward, norm_cost = eval_env.get_normalized_score(
+                        eval_reward, eval_cost
+                    )
+                    eval_norm_rew_deque.append(norm_reward)
+                    eval_norm_cost_deque.append(norm_cost)
+                    eval_rew_deque.append(eval_reward)
+                    eval_cost_deque.append(eval_cost)
+                    eval_len_deque.append(eval_len)
+                eval_end_time = time.time()
+                
+                logger.log_tabular("Metrics/EvalEpRet", np.mean(eval_rew_deque))
+                logger.log_tabular("Metrics/EvalEpCost", np.mean(eval_cost_deque))
+                logger.log_tabular("Metrics/EvalEpNormRet", np.mean(eval_norm_rew_deque))
+                logger.log_tabular("Metrics/EvalEpNormCost", np.mean(eval_norm_cost_deque))
+                logger.log_tabular("Metrics/EvalEpLen", np.mean(eval_len_deque))
+                logger.log_tabular("Time/Eval", eval_end_time - eval_start_time)
                 logger.log_tabular("Metrics/Alpha", alpha)
                 logger.log_tabular("Train/Steps", steps)
                 logger.log_tabular("Loss/Loss_bc_policy", pi_loss.mean().item())
@@ -563,7 +559,9 @@ if __name__ == "__main__":
     subfolder = "-".join(["seed", str(args.seed).zfill(3)])
     relpath = "-".join([subfolder, relpath])
     algo = os.path.basename(__file__).split(".")[0]
-    args.log_dir = os.path.join(args.log_dir, args.experiment, args.task, algo, relpath)
+    # Use offline_mpc/logs as base directory (consistent with other scripts)
+    base_log_dir = os.path.join(str(offline_mpc_dir), "logs")
+    args.log_dir = os.path.join(base_log_dir, args.experiment, args.task, algo, relpath)
     if not args.write_terminal:
         terminal_log_name = "terminal.log"
         error_log_name = "error.log"
