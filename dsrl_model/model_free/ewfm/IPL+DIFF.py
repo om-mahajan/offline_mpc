@@ -15,6 +15,7 @@ import os
 import os.path as osp
 import random
 import sys
+from pathlib import Path
 import time
 import functools
 from collections import deque
@@ -28,6 +29,10 @@ from torch.nn.utils.clip_grad import clip_grad_norm_
 from torch.autograd import Variable
 from torch.optim import Adam
 from tqdm import tqdm
+
+current_file = Path(__file__).resolve()
+offline_mpc_dir = current_file.parents[3]  # Go up 3 levels to reach offline_mpc
+sys.path.insert(0, str(offline_mpc_dir))
 
 # Add the repo root to path (adjust if needed)
 sys.path.append(osp.abspath(osp.join(osp.dirname(__file__), '../../../..')))
@@ -57,8 +62,8 @@ EP = 1e-6
 # -------------------------
 default_cfg = {
     # Logging / checkpoint
-    "log_freq": int(1e4),
-    "save_freq": int(2e4),
+    "log_freq": int(2e4),
+    "save_freq": int(5e4),
     "eval_episode_freq": 10,
     "hidden_sizes": [256, 256],
     "max_grad_norm": 1.0,
@@ -69,7 +74,7 @@ default_cfg = {
     "diffusion_steps": 15,
     "train_horizon": 5,
     # IPL / Q pretrain
-    "q_pretrain_iterations": int(5e4),
+    "q_pretrain_iterations": int(20000),
     "q_lr": 3e-4,
     "q_hidden": 256,
     # Value network (V)
@@ -83,7 +88,7 @@ default_cfg = {
     "weight_clip_min": 1e-6,
     "weight_clip_max": 100.0,
     # Iterations (defaults — override via CLI args)
-    "flow_train_iterations": int(1e5),      # phase 2 total iterations
+    "flow_train_iterations": int(1e6),      # phase 2 total iterations
     "batch_size": 64,
     "device": "cuda",
     # gamma (temporal discounting inside trajectory sums / Bellman updates)
@@ -570,6 +575,9 @@ def main(args):
     best_flow_reward = -float('inf')
     pbar = tqdm(range(flow_train_iters), desc="Phase2:Flow", unit="iter", dynamic_ncols=True)
     start_time = time.time()
+    
+    # Initialize eval metrics
+    eval_reward, eval_cost, eval_len = 0.0, 0.0, 0.0
 
     for step in pbar:
         # sample a batch (trajectories)
@@ -591,37 +599,39 @@ def main(args):
             config=config
         )
 
-        # Logging (add more as needed)
-        if (step + 1) % config["log_freq"] == 0 or (step + 1) == flow_train_iters:
-            elapsed = time.time() - start_time
-            logger.log_tabular("Flow/Step", step + 1)
-            logger.log_tabular("Flow/Loss", flow_loss_value)
-            logger.log_tabular("Time/ElapsedSec", elapsed)
-            logger.dump_tabular()
-            print(f"Flow step {step+1}/{flow_train_iters} flow_loss={flow_loss_value:.6f} time={elapsed:.1f}s")
-
         # Periodic eval of flow policy
         if args.use_eval and ((step + 1) % (args.eval_freq or 1000) == 0):
-            eval_reward, eval_cost, eval_len = 0.0, 0.0, 0
+            eval_reward, eval_cost, eval_len = 0.0, 0.0, 0.0
             for _ in range(config["eval_episode_freq"]):
                 r, c, l = evaluate_flow_policy(eval_env, flow_model, device, norm_fn, diffusion_steps=args.diffusion_steps)
-                eval_reward += r; eval_cost += c; eval_len += l
+                eval_reward += r
+                eval_cost += c
+                eval_len += l
             eval_reward /= config["eval_episode_freq"]
             eval_cost /= config["eval_episode_freq"]
             eval_len /= config["eval_episode_freq"]
             print(f"\n[Eval Step {step+1}] Reward: {eval_reward:.2f}, Cost: {eval_cost:.2f}, Len: {eval_len:.2f}")
-            elapsed = time.time() - start_time
-            logger.log_tabular("Train/Step", 0)
-            logger.log_tabular("Train/FlowStep", step + 1)
-            logger.log_tabular("Train/FlowLoss", flow_loss_value)
-            logger.log_tabular("Eval/Reward", eval_reward)
-            logger.log_tabular("Eval/Cost", eval_cost)
-            logger.log_tabular("Eval/Length", eval_len)
-            logger.log_tabular("Time/ElapsedSec", elapsed)
-            logger.dump_tabular()# save best flow by reward
+            
+            # save best flow by reward
             if eval_reward > best_flow_reward:
                 best_flow_reward = eval_reward
                 logger.torch_save(itr=step+1, torch_saver_elements=flow_model, prefix="flow_best")
+
+        # Logging - ALWAYS log all metrics (use last eval values or 0.0)
+        if (step + 1) % config["log_freq"] == 0 or (step + 1) == flow_train_iters:
+            elapsed = time.time() - start_time
+            logger.log_tabular("Train/Step", q_pretrain_iters + step + 1)  # Continue from Phase 1
+            logger.log_tabular("Q/PrefLoss", 0.0)  # Phase 1 metrics (not training anymore)
+            logger.log_tabular("Q/RegLoss", 0.0)
+            logger.log_tabular("V/Loss", 0.0)
+            logger.log_tabular("Flow/Step", step + 1)
+            logger.log_tabular("Flow/Loss", flow_loss_value)
+            logger.log_tabular("Eval/Reward", eval_reward)  # Always log (will be 0.0 until first eval)
+            logger.log_tabular("Eval/Cost", eval_cost)
+            logger.log_tabular("Eval/Length", eval_len)
+            logger.log_tabular("Time/ElapsedSec", elapsed)
+            logger.dump_tabular()
+            print(f"Flow step {step+1}/{flow_train_iters} flow_loss={flow_loss_value:.6f} eval_r={eval_reward:.2f} eval_c={eval_cost:.2f} time={elapsed:.1f}s")
 
         # Checkpoint saving
         if (step + 1) % config["save_freq"] == 0 or (step + 1) == flow_train_iters:
