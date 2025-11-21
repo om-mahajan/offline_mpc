@@ -7,20 +7,6 @@ from diffusion_SDE import dpm_solver_pytorch
 from diffusion_SDE import schedule
 from scipy.special import softmax
 
-from diffusion_SDE.riemannian_ode_solver import RiemannianODESolver
-from diffusion_SDE.utils.manifolds import Euclidean
-from diffusion_SDE.utils import ModelWrapper
-
-class FMWrapper(ModelWrapper):
-    """Wraps the ScoreNet (flow model) into the ModelWrapper interface expected by RiemannianODESolver."""
-    def __init__(self, model):
-        super().__init__()
-        self.model = model
-
-    def forward(self, x, t, **kwargs):
-        # Expect x: [B, D], t: scalar tensor or tensor shape [B]
-        return self.model(x, t)
-
 def update_target(new, target, tau):
     # Update the frozen target models
     for param, target_param in zip(new.parameters(), target.parameters()):
@@ -156,7 +142,7 @@ class ScoreBase(nn.Module):
         return out_actions
 
     def sample(self, states, sample_per_state=16, diffusion_steps=15, is_numpy=True):
-        num_states = states.shape[0]
+zzzzzzzzzzzzzzzzzzz        num_states = states.shape[0]
         with torch.no_grad():
             states = torch.FloatTensor(states).to(self.device) if is_numpy else states
             states = torch.repeat_interleave(states, sample_per_state, dim=0)

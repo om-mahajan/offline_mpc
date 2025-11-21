@@ -54,8 +54,8 @@ EP = 1e-6
 # -------------------------
 default_cfg = {
     # Logging / checkpoint
-    "log_freq": int(1e4),
-    "save_freq": int(2e4),
+    "log_freq": int(2e4),
+    "save_freq": int(5e4),
     "eval_episode_freq": 3,
     "hidden_sizes": [256, 256],
     "max_grad_norm": 1.0,
@@ -128,45 +128,104 @@ def find_alpha(cost_model, union_obs, union_act, config):
 # -------------------------
 def sample_trajectory_batch_from_splits(dataset_splits, batch_size, train_horizon, device, norm_fn=None):
     """
-    Sample trajectory chunks from negative and union sets
+    Sample trajectory chunks from negative and union sets.
+    Supports both full trajectories (lists) and fixed-horizon tensors.
+    
     Returns: neg_obs, neg_acts, union_obs, union_acts, union_rewards
     Shapes: [horizon, batch, dim]
     """
-    neg_data = dataset_splits['negative']
-    union_data = dataset_splits['union']
-    neg_len = neg_data['observations'].shape[1]
-    union_len = union_data['observations'].shape[1]
+    # Check if using full trajectories (list) or fixed tensors
+    if isinstance(dataset_splits['negative'], list):
+        # Full trajectories mode
+        neg_trajs = dataset_splits['negative']
+        union_trajs = dataset_splits['union']
+        
+        neg_obs_batch, neg_act_batch = [], []
+        union_obs_batch, union_act_batch, union_rew_batch = [], [], []
+        
+        for i in range(batch_size):
+            # Sample random trajectories
+            neg_traj = neg_trajs[np.random.randint(0, len(neg_trajs))]
+            union_traj = union_trajs[np.random.randint(0, len(union_trajs))]
+            
+            # Sample random start points within each trajectory
+            neg_len = len(neg_traj['observations'])
+            union_len = len(union_traj['observations'])
+            
+            max_start_neg = max(0, neg_len - train_horizon)
+            max_start_union = max(0, union_len - train_horizon)
+            
+            neg_start = np.random.randint(0, max_start_neg + 1) if max_start_neg > 0 else 0
+            union_start = np.random.randint(0, max_start_union + 1) if max_start_union > 0 else 0
+            
+            # Extract chunks
+            neg_obs_chunk = neg_traj['observations'][neg_start:neg_start + train_horizon]
+            neg_act_chunk = neg_traj['actions'][neg_start:neg_start + train_horizon]
+            union_obs_chunk = union_traj['observations'][union_start:union_start + train_horizon]
+            union_act_chunk = union_traj['actions'][union_start:union_start + train_horizon]
+            union_rew_chunk = union_traj.get('rewards', np.zeros(len(union_act_chunk)))[union_start:union_start + train_horizon]
+            
+            # Pad if necessary (for short trajectories)
+            if len(neg_obs_chunk) < train_horizon:
+                pad_len = train_horizon - len(neg_obs_chunk)
+                neg_obs_chunk = np.pad(neg_obs_chunk, ((0, pad_len), (0, 0)), mode='edge')
+                neg_act_chunk = np.pad(neg_act_chunk, ((0, pad_len), (0, 0)), mode='edge')
+            if len(union_obs_chunk) < train_horizon:
+                pad_len = train_horizon - len(union_obs_chunk)
+                union_obs_chunk = np.pad(union_obs_chunk, ((0, pad_len), (0, 0)), mode='edge')
+                union_act_chunk = np.pad(union_act_chunk, ((0, pad_len), (0, 0)), mode='edge')
+                union_rew_chunk = np.pad(union_rew_chunk, (0, pad_len), mode='edge')
+            
+            neg_obs_batch.append(neg_obs_chunk)
+            neg_act_batch.append(neg_act_chunk)
+            union_obs_batch.append(union_obs_chunk)
+            union_act_batch.append(union_act_chunk)
+            union_rew_batch.append(union_rew_chunk)
+        
+        # Stack and transpose -> [horizon, batch, dim]
+        neg_obs = torch.stack([torch.as_tensor(x, dtype=torch.float32) for x in neg_obs_batch]).transpose(0, 1).to(device)
+        neg_acts = torch.stack([torch.as_tensor(x, dtype=torch.float32) for x in neg_act_batch]).transpose(0, 1).to(device)
+        union_obs = torch.stack([torch.as_tensor(x, dtype=torch.float32) for x in union_obs_batch]).transpose(0, 1).to(device)
+        union_acts = torch.stack([torch.as_tensor(x, dtype=torch.float32) for x in union_act_batch]).transpose(0, 1).to(device)
+        union_rew = torch.stack([torch.as_tensor(x, dtype=torch.float32) for x in union_rew_batch]).transpose(0, 1).to(device)
+        
+    else:
+        # Old fixed-horizon tensor mode
+        neg_data = dataset_splits['negative']
+        union_data = dataset_splits['union']
+        neg_len = neg_data['observations'].shape[1]
+        union_len = union_data['observations'].shape[1]
 
-    neg_indices = torch.randint(0, len(neg_data['observations']), (batch_size,))
-    union_indices = torch.randint(0, len(union_data['observations']), (batch_size,))
+        neg_indices = torch.randint(0, len(neg_data['observations']), (batch_size,))
+        union_indices = torch.randint(0, len(union_data['observations']), (batch_size,))
 
-    max_start_neg = max(1, neg_len - train_horizon)
-    max_start_union = max(1, union_len - train_horizon)
-    neg_starts = torch.randint(0, max_start_neg, (batch_size,))
-    union_starts = torch.randint(0, max_start_union, (batch_size,))
+        max_start_neg = max(1, neg_len - train_horizon)
+        max_start_union = max(1, union_len - train_horizon)
+        neg_starts = torch.randint(0, max_start_neg, (batch_size,))
+        union_starts = torch.randint(0, max_start_union, (batch_size,))
 
-    neg_obs_batch, neg_act_batch = [], []
-    union_obs_batch, union_act_batch, union_rew_batch = [], [], []
+        neg_obs_batch, neg_act_batch = [], []
+        union_obs_batch, union_act_batch, union_rew_batch = [], [], []
 
-    for i in range(batch_size):
-        nidx = neg_indices[i].item()
-        nstart = neg_starts[i].item()
-        uidx = union_indices[i].item()
-        ustart = union_starts[i].item()
+        for i in range(batch_size):
+            nidx = neg_indices[i].item()
+            nstart = neg_starts[i].item()
+            uidx = union_indices[i].item()
+            ustart = union_starts[i].item()
 
-        neg_obs_batch.append(neg_data['observations'][nidx, nstart:nstart + train_horizon])
-        neg_act_batch.append(neg_data['actions'][nidx, nstart:nstart + train_horizon])
+            neg_obs_batch.append(neg_data['observations'][nidx, nstart:nstart + train_horizon])
+            neg_act_batch.append(neg_data['actions'][nidx, nstart:nstart + train_horizon])
 
-        union_obs_batch.append(union_data['observations'][uidx, ustart:ustart + train_horizon])
-        union_act_batch.append(union_data['actions'][uidx, ustart:ustart + train_horizon])
-        union_rew_batch.append(union_data.get('rewards', torch.zeros_like(union_data['actions'][uidx, ustart:ustart + train_horizon])))
+            union_obs_batch.append(union_data['observations'][uidx, ustart:ustart + train_horizon])
+            union_act_batch.append(union_data['actions'][uidx, ustart:ustart + train_horizon])
+            union_rew_batch.append(union_data.get('rewards', torch.zeros_like(union_data['actions'][uidx, ustart:ustart + train_horizon])))
 
-    # stack and transpose -> [horizon, batch, dim]
-    neg_obs = torch.stack([torch.as_tensor(x, dtype=torch.float32) for x in neg_obs_batch]).transpose(0, 1).to(device)
-    neg_acts = torch.stack([torch.as_tensor(x, dtype=torch.float32) for x in neg_act_batch]).transpose(0, 1).to(device)
-    union_obs = torch.stack([torch.as_tensor(x, dtype=torch.float32) for x in union_obs_batch]).transpose(0, 1).to(device)
-    union_acts = torch.stack([torch.as_tensor(x, dtype=torch.float32) for x in union_act_batch]).transpose(0, 1).to(device)
-    union_rew = torch.stack([torch.as_tensor(x, dtype=torch.float32) for x in union_rew_batch]).transpose(0, 1).to(device)
+        # stack and transpose -> [horizon, batch, dim]
+        neg_obs = torch.stack([torch.as_tensor(x, dtype=torch.float32) for x in neg_obs_batch]).transpose(0, 1).to(device)
+        neg_acts = torch.stack([torch.as_tensor(x, dtype=torch.float32) for x in neg_act_batch]).transpose(0, 1).to(device)
+        union_obs = torch.stack([torch.as_tensor(x, dtype=torch.float32) for x in union_obs_batch]).transpose(0, 1).to(device)
+        union_acts = torch.stack([torch.as_tensor(x, dtype=torch.float32) for x in union_act_batch]).transpose(0, 1).to(device)
+        union_rew = torch.stack([torch.as_tensor(x, dtype=torch.float32) for x in union_rew_batch]).transpose(0, 1).to(device)
 
     if norm_fn is not None:
         neg_obs = norm_fn(neg_obs)
@@ -342,21 +401,42 @@ def critic_nu_loss_and_step(
 
 # -------------------------
 # Evaluate diffusion policy (reused from Script A)
+# Modified to generate horizon-length sequences and use only first action
 # -------------------------
 @torch.no_grad()
-def evaluate_flow_policy(eval_env, score_model, device, norm_fn, diffusion_steps=15):
+def evaluate_flow_policy(eval_env, score_model, device, norm_fn, diffusion_steps=15, eval_horizon=5):
+    """
+    Evaluate flow policy by generating horizon-length action sequences.
+    Only the first action from each sequence is executed in the environment.
+    
+    Args:
+        eval_horizon: Length of action sequence to generate (default: 5)
+    """
     eval_done = False
     eval_obs, _ = eval_env.reset()
     eval_obs = torch.as_tensor(norm_fn(eval_obs), dtype=torch.float32, device=device).unsqueeze(0)
     eval_reward, eval_cost, eval_len = 0.0, 0.0, 0
+    
     while not eval_done:
-        act = score_model.select_actions(eval_obs, diffusion_steps=diffusion_steps)
-        if isinstance(act, list):
-            act_np = act[0]
-        elif isinstance(act, np.ndarray):
-            act_np = act
+        # Generate horizon-length action sequence conditioned on current observation
+        # Repeat observation for horizon length: [horizon, obs_dim] (without batch dimension)
+        # ScoreNet.select_actions expects [batch, obs_dim] where batch = horizon in this case
+        obs_horizon = eval_obs.squeeze(0).repeat(eval_horizon, 1)  # [horizon, obs_dim]
+        
+        # Generate action sequence
+        # select_actions expects: states [batch, obs_dim], returns [batch, act_dim]
+        act_sequence = score_model.select_actions(obs_horizon, diffusion_steps=diffusion_steps)
+        
+        # Extract first action only
+        if isinstance(act_sequence, list):
+            act_np = act_sequence[0]  # First action from the sequence
+        elif isinstance(act_sequence, np.ndarray):
+            act_np = act_sequence[0] if act_sequence.ndim > 1 else act_sequence
         else:
-            act_np = act.squeeze().cpu().numpy()
+            # Tensor: [horizon, act_dim] -> take first timestep [act_dim]
+            act_np = act_sequence[0].cpu().numpy()
+        
+        # Execute only the first action
         next_obs, reward, terminated, truncated, info = eval_env.step(act_np)
         cost = info.get("cost", 0.0)
         next_obs = torch.as_tensor(norm_fn(next_obs), dtype=torch.float32, device=device).unsqueeze(0)
@@ -407,16 +487,37 @@ def main(args):
     eval_env.reset(seed=args.seed)
 
     # Load DSRL dataset via DSRLSafetyDataset (Script A)
-    dsrl_dataset = DSRLSafetyDataset(env_name=args.task, num_negative=args.num_non_preferred, horizon=100, device=device)
+    # Filter trajectories: only keep those with reward > high_reward_ratio * max_reward
+    # Then split into negative (high-cost) and union (remaining high-reward) sets
+    # Store full trajectories (not truncated) - will sample chunks during training
+    dsrl_dataset = DSRLSafetyDataset(
+        env_name=args.task, 
+        num_negative=args.num_non_preferred, 
+        horizon=config["train_horizon"],  # Used for sampling chunks, not truncating
+        device=device,
+        high_reward_ratio=args.high_reward_ratio,
+        store_full_trajectories=True  # Keep full trajectories
+    )
     dataset_splits = dsrl_dataset.get_sets()
 
     # Normalization (optional)
     mu_obs, std_obs = None, None
     if args.normalize_observation:
-        all_obs = torch.cat([
-            dataset_splits['negative']['observations'].reshape(-1, dsrl_dataset.obs_dim),
-            dataset_splits['union']['observations'].reshape(-1, dsrl_dataset.obs_dim)
-        ])
+        # Handle full trajectories (list) vs fixed tensors
+        if isinstance(dataset_splits['negative'], list):
+            # Full trajectories: concatenate all observations
+            all_obs_list = []
+            for traj in dataset_splits['negative']:
+                all_obs_list.append(torch.as_tensor(traj['observations'], dtype=torch.float32))
+            for traj in dataset_splits['union']:
+                all_obs_list.append(torch.as_tensor(traj['observations'], dtype=torch.float32))
+            all_obs = torch.cat([obs.reshape(-1, dsrl_dataset.obs_dim) for obs in all_obs_list])
+        else:
+            # Fixed tensors
+            all_obs = torch.cat([
+                dataset_splits['negative']['observations'].reshape(-1, dsrl_dataset.obs_dim),
+                dataset_splits['union']['observations'].reshape(-1, dsrl_dataset.obs_dim)
+            ])
         mu_obs = all_obs.mean(dim=0)
         std_obs = all_obs.std(dim=0)
     norm_fn = functools.partial(normalize_observation, mu_obs, std_obs)
@@ -499,8 +600,20 @@ def main(args):
 
     print("Cost pretraining finished. Computing alpha...")
     # compute alpha (on union flatten)
-    union_obs_flat_all = dataset_splits['union']['observations'].reshape(-1, dsrl_dataset.obs_dim).to(device)
-    union_acts_flat_all = dataset_splits['union']['actions'].reshape(-1, eval_env.action_space.shape[0]).to(device)
+    if isinstance(dataset_splits['union'], list):
+        # Full trajectories: concatenate all observations and actions
+        union_obs_list = []
+        union_acts_list = []
+        for traj in dataset_splits['union']:
+            union_obs_list.append(torch.as_tensor(traj['observations'], dtype=torch.float32, device=device))
+            union_acts_list.append(torch.as_tensor(traj['actions'], dtype=torch.float32, device=device))
+        union_obs_flat_all = torch.cat([obs.reshape(-1, dsrl_dataset.obs_dim) for obs in union_obs_list])
+        union_acts_flat_all = torch.cat([acts.reshape(-1, act_dim) for acts in union_acts_list])
+    else:
+        # Fixed tensors
+        union_obs_flat_all = dataset_splits['union']['observations'].reshape(-1, dsrl_dataset.obs_dim).to(device)
+        union_acts_flat_all = dataset_splits['union']['actions'].reshape(-1, eval_env.action_space.shape[0]).to(device)
+    
     alpha = find_alpha(cost_model=cost_model, union_obs=union_obs_flat_all, union_act=union_acts_flat_all, config=config)
     logger_phase1.log(f"Found alpha: {alpha:.6f}")
     print(f"Alpha = {alpha:.6f}")
@@ -628,7 +741,11 @@ def main(args):
             eval_reward, eval_cost, eval_len = 0.0, 0.0, 0
             # run a few episodes
             for _ in range(config["eval_episode_freq"]):
-                r, c, l = evaluate_flow_policy(eval_env, flow_model, device, norm_fn, diffusion_steps=args.diffusion_steps)
+                r, c, l = evaluate_flow_policy(
+                    eval_env, flow_model, device, norm_fn, 
+                    diffusion_steps=args.diffusion_steps,
+                    eval_horizon=config["train_horizon"]
+                )
                 eval_reward += r; eval_cost += c; eval_len += l
             eval_reward /= config["eval_episode_freq"]
             eval_cost /= config["eval_episode_freq"]
@@ -694,6 +811,8 @@ if __name__ == "__main__":
                         help="Number of negative (unsafe) trajectories for NU learning")
     parser.add_argument("--num_union", type=int, default=-1, 
                         help="Number of union trajectories (-1 = all remaining)")
+    parser.add_argument("--high_reward_ratio", type=float, default=0.5,
+                        help="Filter trajectories: only keep those with reward >= high_reward_ratio * max_reward (default: 0.5 = 50%%)")
     parser.add_argument("--normalize_observation", action="store_true", 
                         help="Normalize observations")
     
@@ -737,7 +856,7 @@ if __name__ == "__main__":
                         help="Use energy-based advantage weighting (slower but more accurate). If False, uses uniform weights (faster).")
     
     # Evaluation
-    parser.add_argument("--use_eval", action="store_true", default=True, 
+    parser.add_argument("--use_eval", action="store_true", default=False, 
                         help="Enable periodic evaluation")
     parser.add_argument("--eval_freq", type=int, default=20000, 
                         help="Evaluation frequency (steps)")
@@ -745,9 +864,9 @@ if __name__ == "__main__":
                         help="Number of episodes per evaluation")
     
     # Logging frequency
-    parser.add_argument("--log_freq", type=int, default=1000, 
+    parser.add_argument("--log_freq", type=int, default=20000, 
                         help="Logging frequency (steps)")
-    parser.add_argument("--save_freq", type=int, default=2000, 
+    parser.add_argument("--save_freq", type=int, default=20000, 
                         help="Model checkpoint frequency (steps)")
     
     args = parser.parse_args()
@@ -761,7 +880,8 @@ if __name__ == "__main__":
     print(f"Task: {args.task}")
     print(f"Seed: {args.seed}")
     print(f"Device: {args.device}")
-    print(f"Dataset: {args.num_non_preferred} negative + union trajectories")
+    print(f"Dataset filter: Only trajectories with reward >= {args.high_reward_ratio*100:.0f}% of max reward")
+    print(f"Dataset: {args.num_non_preferred} negative (high-cost) + union (high-reward) trajectories")
     print(f"Phase 1 (Cost): {args.cost_pretrain_iterations} iterations")
     print(f"Phase 2 (Flow): {args.flow_train_iterations} iterations")
     print(f"Batch size: {args.batch_size}, Horizon: {args.train_horizon}")

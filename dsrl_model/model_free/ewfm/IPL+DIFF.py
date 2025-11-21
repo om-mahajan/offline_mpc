@@ -64,7 +64,7 @@ default_cfg = {
     # Logging / checkpoint
     "log_freq": int(2e4),
     "save_freq": int(5e4),
-    "eval_episode_freq": 10,
+    "eval_episode_freq": 3,
     "hidden_sizes": [256, 256],
     "max_grad_norm": 1.0,
     # Optimization
