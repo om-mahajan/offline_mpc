@@ -116,69 +116,200 @@ class ScoreBase(nn.Module):
         self.output_dim = output_dim
         self.embed = nn.Sequential(GaussianFourierProjection(embed_dim=embed_dim),
             nn.Linear(embed_dim, embed_dim))
-        self.device=args.device
-        self.noise_schedule = dpm_solver_pytorch.NoiseScheduleVP(schedule=args.schedule)
-        self.dpm_solver = dpm_solver_pytorch.DPM_Solver(self.forward_dmp_wrapper_fn, self.noise_schedule, predict_x0=True)
-        # self.dpm_solver = dpm_solver_pytorch.DPM_Solver(self.forward_dmp_wrapper_fn, self.noise_schedule)
+        self.device = args.device if (args is not None and hasattr(args, 'device')) else ('cuda' if torch.cuda.is_available() else 'cpu')
+
+
+# DPM solver components are optional; only used in diffusion mode.
+        self.noise_schedule = None
+        self.dpm_solver = None
+        if dpm_solver_pytorch is not None and args is not None and hasattr(args, 'schedule'):
+            try:
+                self.noise_schedule = dpm_solver_pytorch.NoiseScheduleVP(schedule=args.schedule)
+            except Exception:
+                self.noise_schedule = None
+
+
+# marginal_prob_std: callable(t) -> (alpha_t, std_t) OR None for Flow Matching mode
         self.marginal_prob_std = marginal_prob_std
         self.args = args
+        self.condition = None
+
+
+    def maybe_init_dpm_solver(self):
+# initialize dpm solver only if marginal_prob_std is provided and dpm solver library available
+        if self.marginal_prob_std is None:
+            return
+        if dpm_solver_pytorch is None:
+            return
+        if self.noise_schedule is None and self.args is not None and hasattr(self.args, 'schedule'):
+            self.noise_schedule = dpm_solver_pytorch.NoiseScheduleVP(schedule=self.args.schedule)
+        if self.dpm_solver is None and self.noise_schedule is not None:
+# create solver using a wrapper that expects diffusion-mode score
+            self.dpm_solver = dpm_solver_pytorch.DPM_Solver(self.forward_dmp_wrapper_fn, self.noise_schedule, predict_x0=True)
+
 
     def forward_dmp_wrapper_fn(self, x, t):
-        return -self(x, t) * self.marginal_prob_std(t)[1][..., None]
-    
+# This wrapper is used by the DPM_Solver and expects the diffusion-mode score
+        if self.marginal_prob_std is None:
+            raise RuntimeError("DPM wrapper called but marginal_prob_std is None. DPM-Solver available only in diffusion mode.")
+# In diffusion mode, self(x,t) must return the score s = h / sigma
+        score = self(x, t)
+        sigma = self.marginal_prob_std(t)[1]
+    # return -score * sigma => -h (consistent with earlier wrapper behavior)
+        return - score * sigma[..., None]
+
+
     def dpm_wrapper_sample(self, dim, batch_size, is_numpy=True, **kwargs):
+# Only valid in diffusion mode
+        if self.marginal_prob_std is None:
+            raise RuntimeError("dpm_wrapper_sample() called in Flow Matching mode. DPM-Solver sampling is only valid in diffusion mode.")
+        self.maybe_init_dpm_solver()
+        if self.dpm_solver is None:
+            raise RuntimeError("DPM solver not available or not initialized.")
         with torch.no_grad():
             init_x = torch.randn(batch_size, dim, device=self.device)
             sample = self.dpm_solver.sample(init_x, **kwargs)
             return sample.cpu().numpy() if is_numpy else sample
-    
+
+
     def forward(self, x, t, condition=None):
         raise NotImplementedError
 
+
     def select_actions(self, states, diffusion_steps=15):
-        multiple_input=True
+        multiple_input = True
         with torch.no_grad():
-            # Handle both numpy arrays and tensors
             if not isinstance(states, torch.Tensor):
                 states = torch.FloatTensor(states).to(self.device)
             else:
                 states = states.to(self.device)
-            
-            if states.dim == 1:
+
+
+            if states.dim() == 1:
                 states = states.unsqueeze(0)
-                multiple_input=False
+                multiple_input = False
             num_states = states.shape[0]
-            self.condition = states
-            results = self.dpm_wrapper_sample(self.output_dim, batch_size=states.shape[0], steps=diffusion_steps, order=2)
-            actions = results.reshape(num_states, self.output_dim).copy() # <bz, A>
-            self.condition = None
+
+
+# If in diffusion mode, use DPM-Solver
+            if self.marginal_prob_std is not None:
+                self.condition = states
+                self.maybe_init_dpm_solver()
+                if self.dpm_solver is None:
+                    raise RuntimeError("DPM solver not initialized; cannot sample.")
+                results = self.dpm_wrapper_sample(self.output_dim, batch_size=states.shape[0], steps=diffusion_steps, order=2)
+                actions = results.reshape(num_states, self.output_dim).copy()
+                self.condition = None
+            else:
+# Flow Matching mode: perform simple Euler integration of the learned vector field.
+# IMPORTANT: This is a simple fallback sampler for quick testing. For accurate sampling, integrate the ODE using
+# a proper ODE solver (e.g., RK4 or adaptive solvers) with v_theta as the vector field.
+                self.condition = states
+                B = states.shape[0]
+                D = self.output_dim  # flattened trajectory dimension (H * act_dim)
+
+                # initial condition: zeros (deterministic conditional policy)
+                x0 = torch.zeros(B, D, device=self.device)
+
+                # wrap model and construct solver
+                velocity = FMWrapper(self)
+                manifold = Euclidean()
+                solver = RiemannianODESolver(manifold=manifold, velocity_model=velocity)
+
+                # integration hyperparams
+                # diffusion_steps used as number of ODE steps; you pass it from call
+                step_size = 1.0 / float(diffusion_steps)
+                time_grid = torch.tensor([0.0, 1.0], device=self.device)
+
+                # call solver: returns x(t=1) shape [B, D]
+                x1 = solver.sample(
+                    x_init=x0,
+                    step_size=step_size,
+                    projx=True,
+                    proju=True,
+                    method="rk4",
+                    time_grid=time_grid,
+                    return_intermediates=False,
+                    verbose=False,
+                    enable_grad=False,
+                )
+
+                # reshape to actions; ensure numpy for compatibility with existing code
+                actions = x1.reshape(B, D).detach().cpu().numpy()
+                self.condition = None
+
+
         out_actions = [actions[i] for i in range(actions.shape[0])] if multiple_input else actions[0]
         return out_actions
 
+
+    @torch.no_grad()
     def sample(self, states, sample_per_state=16, diffusion_steps=15, is_numpy=True):
         num_states = states.shape[0]
-        with torch.no_grad():
-            states = torch.FloatTensor(states).to(self.device) if is_numpy else states
-            states = torch.repeat_interleave(states, sample_per_state, dim=0)
-            self.condition = states
-            results = self.dpm_wrapper_sample(self.output_dim, batch_size=states.shape[0], steps=diffusion_steps, order=2, is_numpy=is_numpy)
-            actions = results[:, :].reshape(num_states, sample_per_state, self.output_dim)
-            if is_numpy:
-                actions = actions.copy()
-            self.condition = None
+
+        # Convert to tensor
+        states = torch.FloatTensor(states).to(self.device) if is_numpy else states.to(self.device)
+
+        # Repeat conditioning for sampling multiple trajectories
+        states = torch.repeat_interleave(states, sample_per_state, dim=0)
+
+        # Store conditioning for the model
+        self.condition = states
+
+        # Case 1: Diffusion mode (legacy)
+        if self.marginal_prob_std is not None:
+            results = self.dpm_wrapper_sample(
+                self.output_dim,
+                batch_size=states.shape[0],
+                steps=diffusion_steps,
+                order=2,
+                is_numpy=is_numpy
+            )
+
+        # Case 2: Flow Matching ODE mode
+        else:
+            # Build Euclidean manifold & wrapped velocity field
+            manifold = Euclidean()
+            velocity = FMWrapper(self)
+            solver = RiemannianODESolver(manifold, velocity)
+
+            # Initial x0 (deterministic FM policy)
+            x0 = torch.zeros(states.shape[0], self.output_dim, device=self.device)
+
+            # ODE step size
+            step_size = 1.0 / diffusion_steps
+
+            # Integrate from t=0 → t=1
+            xt = solver.sample(
+                x_init=x0,
+                step_size=step_size,
+                method="rk4",         # best stability
+                projx=True,
+                proju=True,
+                time_grid=torch.tensor([0., 1.], device=self.device),
+            )
+
+            results = xt.detach().cpu().numpy() if is_numpy else xt
+
+        # reshape to [num_states, sample_per_state, output_dim]
+        actions = results.reshape(num_states, sample_per_state, self.output_dim)
+
+        if is_numpy:
+            actions = actions.copy()
+
+        self.condition = None
         return actions
 
 
 class ScoreNet(ScoreBase):
     def __init__(self, input_dim, output_dim, marginal_prob_std, embed_dim=32, **kwargs):
         super().__init__(input_dim, output_dim, marginal_prob_std, embed_dim, **kwargs)
-        # The swish activation function (removed unused lambda to enable pickling)
         self.pre_sort_condition = nn.Sequential(Dense(input_dim-output_dim, 32), SiLU())
         self.sort_t = nn.Sequential(
-                        nn.Linear(64, 128),                        
-                        SiLU(),
-                        nn.Linear(128, 128),
-                    )
+            nn.Linear(64, 128),
+            SiLU(),
+            nn.Linear(128, 128),
+        )
         self.down_block1 = Residual_Block(output_dim, 512)
         self.down_block2 = Residual_Block(512, 256)
         self.down_block3 = Residual_Block(256, 128)
@@ -186,19 +317,19 @@ class ScoreNet(ScoreBase):
         self.up_block3 = Residual_Block(256, 256)
         self.up_block2 = Residual_Block(512, 512)
         self.last = nn.Linear(1024, output_dim)
-        
     def forward(self, x, t, condition=None):
         embed = self.embed(t)
-        
         if condition is not None:
             embed = torch.cat([self.pre_sort_condition(condition), embed], dim=-1)
         else:
+            if self.condition is None:
+                raise RuntimeError("No condition available for ScoreNet. Provide `condition` or set `self.condition` before calling forward.")
             if self.condition.shape[0] == x.shape[0]:
                 condition = self.condition
             elif self.condition.shape[0] == 1:
                 condition = torch.cat([self.condition]*x.shape[0])
             else:
-                assert False
+                raise RuntimeError("Condition batch-size mismatch")
             embed = torch.cat([self.pre_sort_condition(condition), embed], dim=-1)
         embed = self.sort_t(embed)
         d1 = self.down_block1(x, embed)
@@ -210,129 +341,72 @@ class ScoreNet(ScoreBase):
         u0 = torch.cat([d1, u1], dim=-1)
         h = self.last(u0)
         self.h = h
-
-        # Normalize output
-        return h / self.marginal_prob_std(t)[1][..., None]
+# Mode switch: if marginal_prob_std is None -> Flow Matching mode (return vector-field directly)
+        if self.marginal_prob_std is None:
+            return h
+# Otherwise diffusion mode: return score = h / sigma_t
+        sigma = self.marginal_prob_std(t)[1]
+        return h / sigma[..., None]
     @torch.no_grad()
-    def sample_trajectory(self, obs, diffusion_steps=15, horizon=None, act_dim=None, order=2):
-        """
-        Generate a full action trajectory conditioned on observation using the DPM-Solver.
-        
-        Args:
-            obs: Observation tensor [B, obs_dim] or numpy array
-            diffusion_steps: Number of diffusion sampling steps
-            horizon: Trajectory length (optional, inferred from output_dim if not provided)
-            act_dim: Action dimension (optional, inferred from output_dim if not provided)
-            order: DPM-Solver order (1 or 2)
-        
-        Returns:
-            Trajectory tensor [B, output_dim] where output_dim = horizon * act_dim
-        
-        Raises:
-            ValueError: If provided horizon/act_dim don't match model's output_dim
-        """
+    
+    @torch.no_grad()
+    def sample_trajectory(self, obs, diffusion_steps=15, horizon=None, act_dim=None):
+    
         self.eval()
-        
-        # Handle input conversion (support numpy arrays like select_actions)
+
+        # Convert obs to tensor and batch it
         if not isinstance(obs, torch.Tensor):
             obs = torch.FloatTensor(obs).to(self.device)
         else:
             obs = obs.to(self.device)
-        
-        # Handle 1D input (single state)
+
         if obs.dim() == 1:
             obs = obs.unsqueeze(0)
-        
+
         B = obs.shape[0]
-        
-        # Validate or infer dimensions
-        if horizon is not None and act_dim is not None:
-            expected_dim = horizon * act_dim
-            if expected_dim != self.output_dim:
-                raise ValueError(
-                    f"Provided horizon={horizon} and act_dim={act_dim} imply "
-                    f"trajectory dimension {expected_dim}, but model output_dim={self.output_dim}. "
-                    f"Either omit these arguments or ensure horizon * act_dim == output_dim."
-                )
-            traj_dim = expected_dim
-        elif horizon is not None:
-            # Infer act_dim from output_dim and horizon
-            if self.output_dim % horizon != 0:
-                raise ValueError(
-                    f"output_dim={self.output_dim} is not divisible by horizon={horizon}"
-                )
-            act_dim = self.output_dim // horizon
-            traj_dim = self.output_dim
-        elif act_dim is not None:
-            # Infer horizon from output_dim and act_dim
-            if self.output_dim % act_dim != 0:
-                raise ValueError(
-                    f"output_dim={self.output_dim} is not divisible by act_dim={act_dim}"
-                )
-            horizon = self.output_dim // act_dim
-            traj_dim = self.output_dim
-        else:
-            # No dimensions provided - use model's output_dim directly
-            traj_dim = self.output_dim
-        
-        # Store condition (required by forward_dmp_wrapper_fn via self.condition)
         self.condition = obs
-        
-        try:
-            # Sample with DPM-Solver
-            init_x = torch.randn(B, traj_dim, device=self.device)
-            x = self.dpm_solver.sample(
-                init_x,
-                steps=diffusion_steps,
-                order=order,
-                skip_type="time_uniform",
-                method="singlestep",
-            )
-        except Exception as e:
-            # Ensure condition is reset even on error
-            self.condition = None
-            raise RuntimeError(f"DPM-Solver sampling failed: {e}") from e
-        finally:
-            # Always reset condition
-            self.condition = None
-        
-        return x  # [B, output_dim]
 
+        # Determine trajectory dimension
+        traj_dim = self.output_dim
 
-    # Optional: Add a helper method for trajectory-based action selection
+        # Initial x0 (deterministic FM policy)
+        x0 = torch.zeros(B, traj_dim, device=self.device)
+
+        # Build solver
+        manifold = Euclidean()
+        velocity = FMWrapper(self)
+        solver = RiemannianODESolver(manifold, velocity)
+
+        # Integrate ODE from t=0 → 1
+        x1 = solver.sample(
+            x_init=x0,
+            step_size=1.0 / diffusion_steps,
+            method="rk4",
+            projx=True,
+            proju=True,
+            time_grid=torch.tensor([0., 1.], device=self.device)
+        )
+
+        self.condition = None
+        return x1        # shape [B, traj_dim]
+
     @torch.no_grad()
-    def select_trajectory_actions(self, states, diffusion_steps=15, horizon=5, 
-                                act_dim=None, use_first_action=True):
-        """
-        Generate action trajectories and optionally return only the first action.
-        
-        Args:
-            states: State tensor [B, obs_dim] or numpy array
-            diffusion_steps: Sampling steps
-            horizon: Trajectory horizon
-            act_dim: Action dimension (inferred if None)
-            use_first_action: If True, return only first action [B, act_dim]
-                            If False, return full trajectory [B, horizon, act_dim]
-        
-        Returns:
-            Actions as numpy array
-        """
-        # Sample full trajectory
+    def select_trajectory_actions(self, states, diffusion_steps=15, horizon=5, act_dim=None, use_first_action=True):
+
         traj_flat = self.sample_trajectory(
-            states, 
+            states,
             diffusion_steps=diffusion_steps,
             horizon=horizon,
             act_dim=act_dim
         )
-        
-        # Infer act_dim if needed
+
         if act_dim is None:
             act_dim = self.output_dim // horizon
-        
+
         B = traj_flat.shape[0]
         traj = traj_flat.reshape(B, horizon, act_dim)
-        
+
         if use_first_action:
-            return traj[:, 0, :].cpu().numpy()  # [B, act_dim]
+            return traj[:, 0, :].cpu().numpy()
         else:
-            return traj.cpu().numpy()  # [B, horizon, act_dim]
+            return traj.cpu().numpy()
