@@ -8,8 +8,8 @@ from diffusion_SDE import schedule
 from scipy.special import softmax
 
 from diffusion_SDE.riemannian_ode_solver import RiemannianODESolver
-from diffusion_SDE.utils.manifolds import Euclidean
-from diffusion_SDE.utils import ModelWrapper
+from diffusion_SDE.utils.manifolds.manifold import Euclidean
+from diffusion_SDE.utils.model_wrapper import ModelWrapper
 
 class FMWrapper(ModelWrapper):
     """Wraps the ScoreNet (flow model) into the ModelWrapper interface expected by RiemannianODESolver."""

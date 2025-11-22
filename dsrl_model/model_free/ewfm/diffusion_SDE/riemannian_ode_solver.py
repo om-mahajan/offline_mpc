@@ -11,8 +11,9 @@ import torch
 from torch import Tensor
 
 from diffusion_SDE.solver import Solver
-from diffusion_SDE.utils import ModelWrapper
-from diffusion_SDE.utils.manifolds import geodesic, Manifold
+from diffusion_SDE.utils.model_wrapper import ModelWrapper
+from diffusion_SDE.utils.manifolds.manifold import Manifold
+from diffusion_SDE.utils.manifolds.utils import geodesic
 
 try:
     from tqdm import tqdm

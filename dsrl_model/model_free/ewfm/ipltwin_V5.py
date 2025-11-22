@@ -1013,7 +1013,7 @@ if __name__ == "__main__":
                         help="Number of temporal folds for downsampling")
     
     # Guidance toggle for ablation
-    parser.add_argument("--use_guidance", action="store_true", default=False,
+    parser.add_argument("--use_guidance", action="store_true", default=True,
                         help="Enable energy-weighted guidance for flow loss (ablation: toggle off to disable)")
 
     # GPU optimization
