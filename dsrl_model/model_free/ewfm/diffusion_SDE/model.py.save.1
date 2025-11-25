@@ -111,7 +111,7 @@ class QGPO_Critic(nn.Module):
         self.args = args
         self.alpha = args.alpha
 class ScoreBase(nn.Module):
-    def __init__(self, input_dim, output_dim, marginal_prob_std, embed_dim=64, args=None):
+    def __init__(self, input_dim, output_dim, marginal_prob_std, embed_dim=128, args=None):
         super().__init__()
         self.output_dim = output_dim
         self.embed = nn.Sequential(GaussianFourierProjection(embed_dim=embed_dim),
@@ -209,7 +209,10 @@ class ScoreBase(nn.Module):
                 D = self.output_dim  # flattened trajectory dimension (H * act_dim)
 
                 # initial condition: zeros (deterministic conditional policy)
-                x0 = torch.zeros(B, D, device=self.device)
+                if self.last_trajectory is None:
+    x0 = torch.randn(states.shape[0], self.output_dim, device=self.device) * 0.1
+else:
+    x0 = self.last_trajectory.clone().to(self.device)
 
                 # wrap model and construct solver
                 velocity = FMWrapper(self)

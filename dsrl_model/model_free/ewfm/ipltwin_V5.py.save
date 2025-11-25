@@ -26,9 +26,10 @@ from torch.optim import Adam
 from tqdm import tqdm
 
 # Add the repo root to path (adjust if needed)
-sys.path.append(osp.abspath(osp.join(osp.dirname(__file__), '../../..')))
+sys.path.append(osp.abspath(osp.join(osp.dirname(__file__), '../../../..')))
 
-
+# Add the repo root to path (adjust if needed)
+sys.path.append(osp.abspath(osp.join(osp.dirname(__
 
 # DSRL imports
 import gymnasium as gym
@@ -231,237 +232,6 @@ def compute_weights_from_qv(q_critic, v_model, union_obs, union_acts, config):
 # ===============================
 # FLOW MATCHING (OT) TRAINING (trajectory-based)
 # ===============================
-
-def sample_trajectory_batch_from_splits(neg_data, union_data, batch_size, train_horizon, device, norm_fn=None, data_on_gpu=True):
-    """
-    Sample trajectory chunks from negative and union numpy arrays.
-    neg_data/union_data: dict with keys ['observations', 'actions', 'rewards', 'costs', ...]
-    Each is a numpy array of shape [num_trajectories, ep_len, dim] (or torch tensor if data_on_gpu=True)
-    
-    Returns: neg_obs, neg_acts, union_obs, union_acts, union_rewards
-    Shapes: [horizon, batch, dim]
-    """
-    if data_on_gpu:
-        # Data already on GPU as tensors
-        neg_obs_array = neg_data['observations']
-        neg_act_array = neg_data['actions']
-        union_obs_array = union_data['observations']
-        union_act_array = union_data['actions']
-        union_rew_array = union_data['rewards']
-        
-        n_neg = neg_obs_array.shape[0]
-        n_union = union_obs_array.shape[0]
-        neg_len = neg_obs_array.shape[1]
-        union_len = union_obs_array.shape[1]
-        
-        # Sample indices
-        neg_indices = torch.randint(0, n_neg, (batch_size,), device=device)
-        union_indices = torch.randint(0, n_union, (batch_size,), device=device)
-        
-        max_start_neg = max(1, neg_len - train_horizon)
-        max_start_union = max(1, union_len - train_horizon)
-        neg_starts = torch.randint(0, max_start_neg, (batch_size,), device=device)
-        union_starts = torch.randint(0, max_start_union, (batch_size,), device=device)
-        
-        neg_obs_batch, neg_act_batch = [], []
-        union_obs_batch, union_act_batch, union_rew_batch = [], [], []
-        
-        for i in range(batch_size):
-            nidx = neg_indices[i].item()
-            nstart = neg_starts[i].item()
-            uidx = union_indices[i].item()
-            ustart = union_starts[i].item()
-            
-            neg_obs_batch.append(neg_obs_array[nidx, nstart:nstart + train_horizon])
-            neg_act_batch.append(neg_act_array[nidx, nstart:nstart + train_horizon])
-            
-            union_obs_batch.append(union_obs_array[uidx, ustart:ustart + train_horizon])
-            union_act_batch.append(union_act_array[uidx, ustart:ustart + train_horizon])
-            union_rew_batch.append(union_rew_array[uidx, ustart:ustart + train_horizon])
-        
-        # stack and transpose -> [horizon, batch, dim]
-        neg_obs = torch.stack(neg_obs_batch).transpose(0, 1)
-        neg_acts = torch.stack(neg_act_batch).transpose(0, 1)
-        union_obs = torch.stack(union_obs_batch).transpose(0, 1)
-        union_acts = torch.stack(union_act_batch).transpose(0, 1)
-        union_rew = torch.stack(union_rew_batch).transpose(0, 1)
-        
-    else:
-        # Original numpy path
-        neg_obs_array = neg_data['observations']
-        neg_act_array = neg_data['actions']
-        union_obs_array = union_data['observations']
-        union_act_array = union_data['actions']
-        union_rew_array = union_data['rewards']
-        
-        n_neg = neg_obs_array.shape[0]
-        n_union = union_obs_array.shape[0]
-        neg_len = neg_obs_array.shape[1]
-        union_len = union_obs_array.shape[1]
-
-        # Sample trajectory indices
-        neg_indices = np.random.randint(0, n_neg, size=batch_size)
-        union_indices = np.random.randint(0, n_union, size=batch_size)
-
-        # Sample starting points
-        max_start_neg = max(1, neg_len - train_horizon)
-        max_start_union = max(1, union_len - train_horizon)
-        neg_starts = np.random.randint(0, max_start_neg, size=batch_size)
-        union_starts = np.random.randint(0, max_start_union, size=batch_size)
-
-        neg_obs_batch, neg_act_batch = [], []
-        union_obs_batch, union_act_batch, union_rew_batch = [], [], []
-
-        for i in range(batch_size):
-            nidx = neg_indices[i]
-            nstart = neg_starts[i]
-            uidx = union_indices[i]
-            ustart = union_starts[i]
-
-            neg_obs_batch.append(neg_obs_array[nidx, nstart:nstart + train_horizon])
-            neg_act_batch.append(neg_act_array[nidx, nstart:nstart + train_horizon])
-
-            union_obs_batch.append(union_obs_array[uidx, ustart:ustart + train_horizon])
-            union_act_batch.append(union_act_array[uidx, ustart:ustart + train_horizon])
-            union_rew_batch.append(union_rew_array[uidx, ustart:ustart + train_horizon])
-
-        # stack and transpose -> [horizon, batch, dim]
-        neg_obs = torch.as_tensor(np.stack(neg_obs_batch), dtype=torch.float32).transpose(0, 1).to(device)
-        neg_acts = torch.as_tensor(np.stack(neg_act_batch), dtype=torch.float32).transpose(0, 1).to(device)
-        union_obs = torch.as_tensor(np.stack(union_obs_batch), dtype=torch.float32).transpose(0, 1).to(device)
-        union_acts = torch.as_tensor(np.stack(union_act_batch), dtype=torch.float32).transpose(0, 1).to(device)
-        union_rew = torch.as_tensor(np.stack(union_rew_batch), dtype=torch.float32).transpose(0, 1).to(device)
-
-    if norm_fn is not None:
-        neg_obs = norm_fn(neg_obs)
-        union_obs = norm_fn(union_obs)
-
-    return neg_obs, neg_acts, union_obs, union_acts, union_rew
-
-def v_update_step(q_critic, v_model, v_optimizer, union_obs, union_acts, neg_obs, neg_acts, config):
-    """
-    Update V(s) to satisfy: V(s) ≈ Q(s,a) - γ V(s')
-    Uses minimum of twin Q values for conservative estimation.
-    """
-    device = union_obs.device
-    horizon, batch = union_obs.shape[0], union_obs.shape[1]
-
-    # Build flat transitions from union set
-    union_next_obs = torch.roll(union_obs, shifts=-1, dims=0)
-    union_next_obs[-1] = union_obs[-1].clone()
-
-    flat_union_obs = union_obs.reshape(-1, union_obs.shape[-1])
-    flat_union_acts = union_acts.reshape(-1, union_acts.shape[-1])
-    flat_union_next = union_next_obs.reshape(-1, union_next_obs.shape[-1])
-
-    if config.get("v_use_neg_in_updates", True):
-        neg_next_obs = torch.roll(neg_obs, shifts=-1, dims=0)
-        neg_next_obs[-1] = neg_obs[-1].clone()
-        flat_neg_obs = neg_obs.reshape(-1, neg_obs.shape[-1])
-        flat_neg_acts = neg_acts.reshape(-1, neg_acts.shape[-1])
-        flat_neg_next = neg_next_obs.reshape(-1, neg_next_obs.shape[-1])
-
-        flat_obs = torch.cat([flat_union_obs, flat_neg_obs], dim=0)
-        flat_acts = torch.cat([flat_union_acts, flat_neg_acts], dim=0)
-        flat_next = torch.cat([flat_union_next, flat_neg_next], dim=0)
-    else:
-        flat_obs = flat_union_obs
-        flat_acts = flat_union_acts
-        flat_next = flat_union_next
-
-    # Compute targets using minimum of twin Q
-    with torch.no_grad():
-        q_flat = q_critic(flat_obs, flat_acts)  # Uses min(Q1, Q2)
-        # Ensure q_flat is 1D
-        if q_flat.dim() > 1:
-            q_flat = q_flat.squeeze(-1)
-        v_next = v_model(flat_next)
-        gamma = config.get("gamma", 1.0)
-        target = q_flat - gamma * v_next
-
-    v_pred = v_model(flat_obs)
-    v_loss = F.mse_loss(v_pred, target)
-
-    v_optimizer.zero_grad()
-    v_loss.backward()
-    clip_grad_norm_(v_model.parameters(), config["max_grad_norm"])
-    v_optimizer.step()
-
-    return {"v_loss": v_loss.detach().item()}
-
-def q_preference_step(q_critic, q_optimizer, neg_obs, neg_acts, union_obs, union_acts, config):
-    """
-    Preference loss: union trajectory preferred over negative
-    Uses TwinQ for robust Q-value estimation with conservative min(Q1, Q2).
-    """
-    horizon, batch = union_obs.shape[0], union_obs.shape[1]
-    device = union_obs.device
-
-    flat_union_obs = union_obs.reshape(-1, union_obs.shape[-1])
-    flat_union_acts = union_acts.reshape(-1, union_acts.shape[-1])
-    flat_neg_obs = neg_obs.reshape(-1, neg_obs.shape[-1])
-    flat_neg_acts = neg_acts.reshape(-1, neg_acts.shape[-1])
-
-    # Compute Q per time-step using BOTH Q networks
-    # TwinQ.both returns (q1, q2) where each is shape [batch*horizon, 1] or [batch*horizon]
-    q1_union, q2_union = q_critic.both(flat_union_obs, flat_union_acts)
-    q1_neg, q2_neg = q_critic.both(flat_neg_obs, flat_neg_acts)
-    
-    # Ensure they are 1D tensors [batch*horizon]
-    if q1_union.dim() > 1:
-        q1_union = q1_union.squeeze(-1)
-        q2_union = q2_union.squeeze(-1)
-        q1_neg = q1_neg.squeeze(-1)
-        q2_neg = q2_neg.squeeze(-1)
-    
-    # Take minimum (conservative estimate, like in SAC/TD3)
-    q_union_flat = torch.min(q1_union, q2_union)
-    q_neg_flat = torch.min(q1_neg, q2_neg)
-
-    q_union = q_union_flat.reshape(horizon, batch)
-    q_neg = q_neg_flat.reshape(horizon, batch)
-    # Trajectory scores (discounted sum)
-    gamma = config.get("gamma", 1.0)
-    if gamma == 1.0:
-        s_union = q_union.sum(dim=0)
-        s_neg = q_neg.sum(dim=0)
-    else:
-        discounts = torch.tensor(
-            [gamma ** i for i in range(horizon)], 
-            device=device, 
-            dtype=q_union.dtype
-        ).unsqueeze(1)
-        s_union = (q_union * discounts).sum(dim=0)
-        s_neg = (q_neg * discounts).sum(dim=0)
-
-    logits = s_union - s_neg
-    labels = torch.ones_like(logits)
-    pref_loss = F.binary_cross_entropy_with_logits(logits, labels)
-
-    # Twin Q regularization (regularize both Q networks)
-    lambda_q = config.get("lambda_q_reg", 1e-2)
-    q1_reg = (q1_union.pow(2).mean() + q1_neg.pow(2).mean()) * 0.5
-    q2_reg = (q2_union.pow(2).mean() + q2_neg.pow(2).mean()) * 0.5
-    q_reg = (q1_reg + q2_reg) * 0.5
-    
-    score_reg = (s_union.pow(2).mean() + s_neg.pow(2).mean()) * 0.5
-    reg_loss = lambda_q * (q_reg + 0.1 * score_reg)
-
-    loss = pref_loss + reg_loss
-
-    q_optimizer.zero_grad()
-    loss.backward()
-    clip_grad_norm_(q_critic.parameters(), config["max_grad_norm"])
-    q_optimizer.step()
-
-    return {
-        "pref_loss": pref_loss.detach().item(),
-        "reg_loss": reg_loss.detach().item(),
-        "total_q_loss": loss.detach().item(),
-        "q1_mean": q1_union.mean().item(),
-        "q2_mean": q2_union.mean().item(),
-        "q_diff": (q1_union - q2_union).abs().mean().item()
-    }
 
 def psi_t_ot(x0, x1, t, sigma_min):
     """OT linear interpolation (per paper Eq.20-22)
@@ -978,7 +748,7 @@ if __name__ == "__main__":
     parser.add_argument("--experiment", type=str, default="twinq")
     parser.add_argument("--normalize_observation", action="store_true", default=False)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--schedule", type=str, default="Linear")
+    parser.add_argument("--schedule", type=str, default="linear")
     parser.add_argument("--diffusion_steps", type=int, default=15)
     parser.add_argument("--energy_alpha", type=float, default=3.0,
                         help="Temperature for energy-guided loss (default: 1.0)")
