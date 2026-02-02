@@ -150,6 +150,10 @@ def sample_trajectory_batch_jax(
     n_neg, neg_len = neg_obs_arr.shape[0], neg_obs_arr.shape[1]
     n_union, union_len = union_obs_arr.shape[0], union_obs_arr.shape[1]
     
+    # Validate trajectory lengths
+    assert neg_len >= train_horizon, f"Negative trajectory length {neg_len} < horizon {train_horizon}"
+    assert union_len >= train_horizon, f"Union trajectory length {union_len} < horizon {train_horizon}"
+    
     # Split RNG
     rng, *keys = jax.random.split(rng, 5)
     
@@ -175,7 +179,9 @@ def sample_trajectory_batch_jax(
     neg_acts = jnp.array(np.stack(neg_act_batch)).transpose(1, 0, 2)
     union_obs = jnp.array(np.stack(union_obs_batch)).transpose(1, 0, 2)
     union_acts = jnp.array(np.stack(union_act_batch)).transpose(1, 0, 2)
-    union_rew = jnp.array(np.stack(union_rew_batch)).transpose(1, 0, 2)
+    # Rewards are scalars: [B, H] -> [H, B] -> [H, B, 1]
+    union_rew = jnp.array(np.stack(union_rew_batch)).transpose(1, 0)
+    union_rew = union_rew[..., None]  # Add trailing dimension: [H, B, 1]
     
     # Normalize observations if stats provided
     if mu_obs is not None:
@@ -494,9 +500,9 @@ def train_flow_step(
         x_t = psi_t_ot(x0, x1, random_t, sigma_min)  # [B, D]
         u_t = u_t_ot(x_t, x1, random_t, sigma_min)    # [B, D]
         
-        # Model prediction
+        # Model prediction (positional args: params, x, t, condition, train)
         v_theta = flow_state.apply_fn(
-            params, x_t, random_t, condition=cond_obs, train=True
+            params, x_t, random_t, cond_obs, True
         )  # [B, D]
         
         # Reshape to per-timestep: [B, D] -> [B, H, act_dim]
@@ -811,6 +817,25 @@ def main(args):
                 q1=f"{q_metrics['q1_mean']:.2f}"
             )
             logger.dump_tabular()
+        
+        # Save checkpoint during Phase 1
+        if (step + 1) % config["save_freq"] == 0:
+            import pickle
+            ckpt_dir = os.path.join(args.log_dir, "checkpoints")
+            os.makedirs(ckpt_dir, exist_ok=True)
+            
+            ckpt_path = os.path.join(ckpt_dir, f"phase1_ckpt_step_{step+1}.pkl")
+            checkpoint = {
+                "phase": 1,
+                "step": step + 1,
+                "q_params": q_state.params,
+                "q_target_params": q_state.target_params,
+                "v_params": v_state.params,
+                "config": config,
+            }
+            with open(ckpt_path, "wb") as f:
+                pickle.dump(checkpoint, f)
+            print(f"\n[Phase1 Checkpoint saved @ step {step+1}] -> {ckpt_path}")
     
     print("Phase 1 complete.")
 
@@ -870,8 +895,23 @@ def main(args):
         
         # Save checkpoint
         if (step + 1) % config["save_freq"] == 0:
-            # TODO: Add checkpoint saving with orbax
-            pass
+            import pickle
+            ckpt_dir = os.path.join(args.log_dir, "checkpoints")
+            os.makedirs(ckpt_dir, exist_ok=True)
+            
+            # Save Q, V, and Flow states
+            ckpt_path = os.path.join(ckpt_dir, f"ckpt_step_{step+1}.pkl")
+            checkpoint = {
+                "step": step + 1,
+                "q_params": q_state.params,
+                "q_target_params": q_state.target_params,
+                "v_params": v_state.params,
+                "flow_params": flow_state.params,
+                "config": config,
+            }
+            with open(ckpt_path, "wb") as f:
+                pickle.dump(checkpoint, f)
+            print(f"\n[Checkpoint saved @ step {step+1}] -> {ckpt_path}")
     
     print("\n" + "=" * 60)
     print("Training complete!")
@@ -927,8 +967,9 @@ if __name__ == "__main__":
                         help="Random seed")
     parser.add_argument("--normalize_observation", action="store_true", default=False,
                         help="Normalize observations")
-    parser.add_argument("--use_guidance", action="store_true", default=True,
-                        help="Use energy-weighted guidance")
+    parser.add_argument("--use_guidance", action="store_false", dest="no_guidance",
+                        help="Disable energy-weighted guidance (default: enabled)")
+    parser.set_defaults(use_guidance=True)
     
     # Evaluation
     parser.add_argument("--use_eval", action="store_true", default=False,
@@ -948,6 +989,18 @@ if __name__ == "__main__":
     parser.add_argument("--gamma", type=float, default=None)
     parser.add_argument("--energy_alpha", type=float, default=None)
     parser.add_argument("--cost_weight_temp", type=float, default=None)
+    
+    # Logging and saving frequencies
+    parser.add_argument("--log_freq", type=int, default=None,
+                        help="Logging frequency")
+    parser.add_argument("--save_freq", type=int, default=None,
+                        help="Checkpoint saving frequency")
+    
+    # Dataset config
+    parser.add_argument("--num_negative_trajectories", type=int, default=None,
+                        help="Number of negative trajectories")
+    parser.add_argument("--num_union_trajectories", type=int, default=None,
+                        help="Number of union trajectories (-1 for all)")
     
     args = parser.parse_args()
     main(args)

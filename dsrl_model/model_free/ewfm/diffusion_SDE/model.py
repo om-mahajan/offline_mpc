@@ -225,9 +225,9 @@ class ScoreBase(nn.Module):
                 x1 = solver.sample(
                     x_init=x0,
                     step_size=step_size,
-                    projx=True,
-                    proju=True,
-                    method="rk4",
+                    projx=False,
+                    proju=False,
+                    method="euler",
                     time_grid=time_grid,
                     return_intermediates=False,
                     verbose=False,
@@ -242,6 +242,153 @@ class ScoreBase(nn.Module):
         out_actions = [actions[i] for i in range(actions.shape[0])] if multiple_input else actions[0]
         return out_actions
 
+
+    def sample_and_logprob(self, states, diffusion_steps=15, hutchinson_samples=1):
+        """
+        Sample actions and compute log-probability for SAC-style entropy.
+        Uses OT flow matching with Hutchinson trace estimator for divergence.
+        
+        Args:
+            states: [B, obs_dim] conditioning states
+            diffusion_steps: number of Euler steps for ODE integration
+            hutchinson_samples: number of random vectors for trace estimation
+        
+        Returns:
+            actions: [B, act_dim] sampled actions (detached)
+            logp: [B] log-probabilities (detached)
+        """
+        # Detach states to avoid graph issues
+        if not isinstance(states, torch.Tensor):
+            states = torch.FloatTensor(states).to(self.device)
+        else:
+            states = states.to(self.device).detach()
+        
+        if states.dim() == 1:
+            states = states.unsqueeze(0)
+        
+        B = states.shape[0]
+        D = self.output_dim
+        
+        # Initial sample from base distribution: x0 ~ N(0, I)
+        x = torch.randn(B, D, device=self.device)
+        
+        # Log-prob of base distribution: log p(x0) = -0.5 * ||x0||^2 - D/2 * log(2π)
+        log_p = -0.5 * (x ** 2).sum(dim=-1) - 0.5 * D * np.log(2 * np.pi)
+        
+        dt = 1.0 / diffusion_steps
+        self.condition = states
+        
+        # Enable gradients for Hutchinson estimator even if called inside no_grad context
+        with torch.enable_grad():
+            for step in range(diffusion_steps):
+                t_val = step * dt
+                t = torch.full((B,), t_val, device=self.device)
+                
+                # Detach and clone to create fresh leaf tensor with gradients
+                x_grad = x.detach().clone().requires_grad_(True)
+                v = self.forward(x_grad, t)
+                
+                # Hutchinson trace estimator: div(v) ≈ E[ε^T ∇v ε]
+                div_v = torch.zeros(B, device=self.device)
+                for h_idx in range(hutchinson_samples):
+                    eps = torch.randn_like(x_grad)
+                    vjp = torch.autograd.grad(
+                        outputs=v, inputs=x_grad,
+                        grad_outputs=eps,
+                        create_graph=False, 
+                        retain_graph=(h_idx < hutchinson_samples - 1)
+                    )[0]
+                    div_v = div_v + (vjp * eps).sum(dim=-1)
+                div_v = div_v / hutchinson_samples
+                
+                # Update log-prob
+                log_p = log_p - div_v.detach() * dt
+                x = x + v.detach() * dt
+        
+        self.condition = None
+        return x.detach(), log_p.detach()
+
+    def sample_and_logprob_fast(self, states, diffusion_steps=10):
+        """
+        Fast approximate sampling with log-prob.
+        Uses simple approximation: logp ≈ -0.5 * ||x0||^2 (ignores Jacobian)
+        Much faster - use for training, full version for evaluation.
+        
+        Args:
+            states: [B, obs_dim] conditioning states
+            diffusion_steps: number of Euler steps
+        
+        Returns:
+            actions: [B, act_dim] sampled actions
+            logp: [B] approximate log-probabilities
+        """
+        with torch.no_grad():
+            if not isinstance(states, torch.Tensor):
+                states = torch.FloatTensor(states).to(self.device)
+            else:
+                states = states.to(self.device)
+            
+            if states.dim() == 1:
+                states = states.unsqueeze(0)
+            
+            B = states.shape[0]
+            D = self.output_dim
+            
+            # Sample from base distribution
+            x0 = torch.randn(B, D, device=self.device)
+            
+            # Track initial log-prob (OT flows are approximately volume-preserving)
+            log_p0 = -0.5 * (x0 ** 2).sum(dim=-1)
+            
+            x = x0
+            dt = 1.0 / diffusion_steps
+            self.condition = states
+            
+            for step in range(diffusion_steps):
+                t = torch.full((B,), step * dt, device=self.device)
+                v = self.forward(x, t)
+                x = x + v * dt
+            
+            self.condition = None
+            return x, log_p0
+
+    def sample_actions_fast(self, states, diffusion_steps=15):
+        """
+        Fast action sampling without log-prob computation.
+        Uses Euler integration for speed.
+        
+        Args:
+            states: [B, obs_dim] conditioning states
+            diffusion_steps: number of Euler steps
+        
+        Returns:
+            actions: [B, act_dim] sampled actions
+        """
+        with torch.no_grad():
+            if not isinstance(states, torch.Tensor):
+                states = torch.FloatTensor(states).to(self.device)
+            else:
+                states = states.to(self.device)
+            
+            if states.dim() == 1:
+                states = states.unsqueeze(0)
+            
+            B = states.shape[0]
+            D = self.output_dim
+            
+            # Start from noise
+            x = torch.randn(B, D, device=self.device)
+            
+            dt = 1.0 / diffusion_steps
+            self.condition = states
+            
+            for step in range(diffusion_steps):
+                t = torch.full((B,), step * dt, device=self.device)
+                v = self.forward(x, t)
+                x = x + v * dt
+            
+            self.condition = None
+            return x
 
     @torch.no_grad()
     def sample(self, states, sample_per_state=16, diffusion_steps=15, is_numpy=True):

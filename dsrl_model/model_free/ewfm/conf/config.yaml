@@ -1,0 +1,75 @@
+# Default configuration for Weighted Flow Matching training
+# Based on original IQ-Learn config structure
+
+defaults:
+  - _self_
+
+# Seed for reproducibility
+seed: 42
+cuda_deterministic: true
+
+# Device (auto-set in code)
+device: "cuda:0"
+
+# Discount factor
+gamma: 0.99
+
+# Maximum gradient norm for clipping
+max_grad_norm: 1.0
+
+# Flow matching hyperparameters
+sigma_min: 0.01
+diffusion_steps: 15
+
+# Checkpoint save frequency
+save_freq: 20000
+
+# Data loading: use DSRL library (True) or hdf5 files (False)
+use_dsrl: true
+
+# DSRL dataset config
+density: 1.0
+inpaint_ranges: []
+non_pref_noise: 0.0
+
+# Environment config
+env:
+  name: "SafetyPointGoal1-v0"  # Override this
+  learn_steps: 100000
+  eval_interval: 5000
+
+# Evaluation config
+eval:
+  n_envs: 4
+  eps: 10
+
+# Training config
+train:
+  batch: 256
+  sep_V: true
+  soft_update: true
+  update_actor_Q: false  # Use weighted flow matching instead
+
+# Agent config
+agent:
+  hidden_dim: 256
+  hidden_depth: 2
+  critic_lr: 0.0003
+  actor_lr: 0.0003
+  value_lr: 0.0003
+  disc_lr: 0.0003
+  critic_tau: 0.005
+  critic_target_update_frequency: 1
+  reward_factor: 1.0
+  pen_bad: false
+
+# Method config (for critic loss)
+method:
+  loss: "v0"  # "v0" or "no"
+  tanh: false  # Whether to apply tanh scaling to Q values
+
+# Expert data config
+expert:
+  n_mix_good: 100  # Number of good trajectories
+  n_mix_bad: 100   # Number of bad trajectories for mix
+  n_bad: 50        # Number of bad trajectories for violation

@@ -1,35 +1,37 @@
 #!/bin/bash
-# run_guided_evaluations.sh
-# Simple script to evaluate GUIDED FLOW models in tmux windows
+# run_eval_V5_hist.sh
+# Script to evaluate V5_hist flow model checkpoints in tmux windows
 
 set -e
 
 # Configuration
 CONDA_ENV="myenv"
 BASE_LOG_DIR="$HOME/safe_diff/offline_mpc/logs/merged"
-EXPERIMENT_SUBDIR="IPLV5/twinq"
+EXPERIMENT_SUBDIR="IPLV5_hist/twinq_fixed_hist"
+ALGO_NAME="ipl_flow_twinq_fm_v5_fixed"
 SCRIPT_DIR="$HOME/safe_diff/offline_mpc/dsrl_model/model_free/ewfm"
-EVAL_SCRIPT="$SCRIPT_DIR/eval_guided_flow.py"
+EVAL_SCRIPT="$SCRIPT_DIR/eval_V5_hist.py"
 
 # Evaluation parameters
 NUM_EPISODES=10
 DIFFUSION_STEPS=15
-STEP_INTERVAL=20000
+STEP_INTERVAL=2000
 MAX_EPISODE_STEPS=1000
 DEVICE="cpu"
-MIN_CHECKPOINT=300000
+MIN_CHECKPOINT=100000  # Minimum checkpoint step to consider complete
 
 # Tasks to evaluate
 TASK1="OfflineSwimmerVelocityGymnasium-v1"
 TASK2="OfflinePointGoal1Gymnasium-v0"
 
 # Tmux session name
-SESSION_NAME="guided_flow_eval"
+SESSION_NAME="eval_V5_hist"
 
 echo "========================================="
-echo "GUIDED Flow Evaluation"
+echo "V5_hist Flow Model Evaluation"
 echo "========================================="
 echo "Experiment: $EXPERIMENT_SUBDIR"
+echo "Algorithm: $ALGO_NAME"
 echo "Min checkpoint: $MIN_CHECKPOINT"
 echo ""
 
@@ -54,13 +56,6 @@ if [ ! -f "$CONDA_SH" ]; then
     exit 1
 fi
 
-# Check if jq is available
-if command -v jq &> /dev/null; then
-    USE_JQ=true
-else
-    USE_JQ=false
-fi
-
 # Function to check if seed folder has sufficient checkpoints
 check_seed_completeness() {
     local seed_dir=$1
@@ -71,9 +66,19 @@ check_seed_completeness() {
         return
     fi
     
+    # Look for flow model checkpoints (not best/final)
     local max_checkpoint=$(find "$torch_save_dir" -name "flow_model_*.pt" 2>/dev/null | \
+        grep -v "best" | grep -v "final" | \
         sed 's/.*flow_model_\([0-9]*\)\.pt/\1/' | \
         sort -n | tail -1)
+    
+    if [ -z "$max_checkpoint" ]; then
+        # Try alternative naming: flow_*.pt
+        max_checkpoint=$(find "$torch_save_dir" -name "flow_*.pt" 2>/dev/null | \
+            grep -v "best" | grep -v "final" | \
+            sed 's/.*flow_\([0-9]*\)\.pt/\1/' | \
+            sort -n | tail -1)
+    fi
     
     if [ -z "$max_checkpoint" ]; then
         echo "incomplete"
@@ -87,52 +92,37 @@ check_seed_completeness() {
     fi
 }
 
-# Function to get horizon from config.json
-get_horizon_from_config() {
-    local seed_dir=$1
-    local config_file="${seed_dir}/config.json"
-    
-    if [ ! -f "$config_file" ]; then
-        echo 5
-        return
-    fi
-    
-    if [ "$USE_JQ" = true ]; then
-        local horizon=$(jq -r '.train_horizon // 5' "$config_file" 2>/dev/null)
-        if [ -z "$horizon" ] || [ "$horizon" = "null" ]; then
-            horizon=5
-        fi
-        echo "$horizon"
-    else
-        local horizon=$(grep -o '"train_horizon"[[:space:]]*:[[:space:]]*[0-9]*' "$config_file" 2>/dev/null | \
-            sed 's/.*:[[:space:]]*\([0-9]*\)/\1/')
-        if [ -z "$horizon" ]; then
-            horizon=5
-        fi
-        echo "$horizon"
-    fi
-}
-
 # Function to find valid seeds for a task
 find_valid_seeds() {
     local task=$1
-    local log_dir="${BASE_LOG_DIR}/${task}/${EXPERIMENT_SUBDIR}/${task}/ipl_flow_twinq_fm"
     
-    if [ ! -d "$log_dir" ]; then
-        echo "ERROR: Directory not found: $log_dir" >&2
-        return
-    fi
+    # Try multiple path patterns
+    local log_dirs=(
+        "${BASE_LOG_DIR}/${task}/${EXPERIMENT_SUBDIR}/${task}/${ALGO_NAME}"
+        "${BASE_LOG_DIR}/${task}/${EXPERIMENT_SUBDIR}/${ALGO_NAME}"
+        "${BASE_LOG_DIR}/${EXPERIMENT_SUBDIR}/${task}/${ALGO_NAME}"
+    )
     
-    local seed_dirs=($(find "$log_dir" -mindepth 1 -maxdepth 1 -type d -name "seed-*" 2>/dev/null | sort))
-    
-    echo "Checking $task: found ${#seed_dirs[@]} seed directories" >&2
-    
-    for seed_dir in "${seed_dirs[@]}"; do
-        local status=$(check_seed_completeness "$seed_dir")
-        if [ "$status" = "complete" ]; then
-            echo "$seed_dir"
+    for log_dir in "${log_dirs[@]}"; do
+        if [ -d "$log_dir" ]; then
+            echo "Checking path: $log_dir" >&2
+            local seed_dirs=($(find "$log_dir" -mindepth 1 -maxdepth 1 -type d -name "seed-*" 2>/dev/null | sort))
+            
+            if [ ${#seed_dirs[@]} -gt 0 ]; then
+                echo "Found ${#seed_dirs[@]} seed directories" >&2
+                
+                for seed_dir in "${seed_dirs[@]}"; do
+                    local status=$(check_seed_completeness "$seed_dir")
+                    if [ "$status" = "complete" ]; then
+                        echo "$seed_dir"
+                    fi
+                done
+                return
+            fi
         fi
     done
+    
+    echo "No directories found for $task" >&2
 }
 
 # Find valid seeds
@@ -149,6 +139,14 @@ TOTAL_SEEDS=$((${#TASK1_SEEDS[@]} + ${#TASK2_SEEDS[@]}))
 
 if [ $TOTAL_SEEDS -eq 0 ]; then
     echo "ERROR: No valid seeds found with checkpoints >= $MIN_CHECKPOINT"
+    echo ""
+    echo "Debugging: Listing available directories..."
+    echo ""
+    for task in "$TASK1" "$TASK2"; do
+        echo "Task: $task"
+        ls -la "${BASE_LOG_DIR}/${task}/${EXPERIMENT_SUBDIR}/" 2>/dev/null || echo "  Path not found"
+        echo ""
+    done
     exit 1
 fi
 
@@ -173,7 +171,6 @@ create_eval_window() {
     local task=$1
     local seed_dir=$2
     local seed_name=$(basename "$seed_dir")
-    local horizon=$(get_horizon_from_config "$seed_dir")
     local window_name="eval_${task:7:10}_${seed_name:5:8}"
     
     if $FIRST_WINDOW; then
@@ -183,25 +180,22 @@ create_eval_window() {
         tmux new-window -t "$SESSION_NAME" -n "$window_name"
     fi
     
-    echo "  [Window $((WINDOW_IDX+1))/$TOTAL_SEEDS] $window_name (horizon=$horizon)"
+    echo "  [Window $((WINDOW_IDX+1))/$TOTAL_SEEDS] $window_name"
     
     tmux send-keys -t "$SESSION_NAME:$window_name" "source $CONDA_SH" C-m
     tmux send-keys -t "$SESSION_NAME:$window_name" "conda activate $CONDA_ENV" C-m
     tmux send-keys -t "$SESSION_NAME:$window_name" "cd $SCRIPT_DIR" C-m
     tmux send-keys -t "$SESSION_NAME:$window_name" "echo '==================================='" C-m
+    tmux send-keys -t "$SESSION_NAME:$window_name" "echo 'V5_hist Evaluation'" C-m
     tmux send-keys -t "$SESSION_NAME:$window_name" "echo 'Task: ${task}'" C-m
     tmux send-keys -t "$SESSION_NAME:$window_name" "echo 'Seed: ${seed_name}'" C-m
-    tmux send-keys -t "$SESSION_NAME:$window_name" "echo 'Horizon: ${horizon}'" C-m
     tmux send-keys -t "$SESSION_NAME:$window_name" "echo '==================================='" C-m
     
     tmux send-keys -t "$SESSION_NAME:$window_name" "python $EVAL_SCRIPT \\" C-m
     tmux send-keys -t "$SESSION_NAME:$window_name" "  --task $task \\" C-m
-    tmux send-keys -t "$SESSION_NAME:$window_name" "  --base_log_dir $BASE_LOG_DIR \\" C-m
-    tmux send-keys -t "$SESSION_NAME:$window_name" "  --experiment_subdir '$EXPERIMENT_SUBDIR' \\" C-m
     tmux send-keys -t "$SESSION_NAME:$window_name" "  --seed_dir '$seed_dir' \\" C-m
     tmux send-keys -t "$SESSION_NAME:$window_name" "  --num_episodes $NUM_EPISODES \\" C-m
     tmux send-keys -t "$SESSION_NAME:$window_name" "  --diffusion_steps $DIFFUSION_STEPS \\" C-m
-    tmux send-keys -t "$SESSION_NAME:$window_name" "  --horizon $horizon \\" C-m
     tmux send-keys -t "$SESSION_NAME:$window_name" "  --step_interval $STEP_INTERVAL \\" C-m
     tmux send-keys -t "$SESSION_NAME:$window_name" "  --max_episode_steps $MAX_EPISODE_STEPS \\" C-m
     tmux send-keys -t "$SESSION_NAME:$window_name" "  --device $DEVICE" C-m
@@ -227,6 +221,13 @@ echo "Tmux session created successfully!"
 echo "========================================="
 echo "Session name: $SESSION_NAME"
 echo "Total windows: $TOTAL_SEEDS"
+echo ""
+echo "Evaluation parameters:"
+echo "  Num episodes: $NUM_EPISODES"
+echo "  Diffusion steps: $DIFFUSION_STEPS"
+echo "  Step interval: $STEP_INTERVAL"
+echo "  Max episode steps: $MAX_EPISODE_STEPS"
+echo "  Device: $DEVICE"
 echo ""
 echo "To attach: tmux attach -t $SESSION_NAME"
 echo "To detach: Ctrl+b d"

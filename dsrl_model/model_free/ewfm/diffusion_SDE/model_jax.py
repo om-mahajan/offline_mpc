@@ -63,6 +63,7 @@ class FlaxResidualBlock(nn.Module):
         t_out = nn.Dense(self.output_dim, name='time_dense')(t_out)
         
         # Dense layers: [B, input_dim] -> [B, output_dim]
+        
         h1 = nn.Dense(self.output_dim, name='dense1')(x)
         h1 = nn.silu(h1)
         h1 = h1 + t_out  # Add time conditioning

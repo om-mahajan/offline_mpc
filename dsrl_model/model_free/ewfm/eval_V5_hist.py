@@ -1,3 +1,12 @@
+#!/usr/bin/env python3
+"""
+Evaluation script for ipltwin_V5_hist.py checkpoints.
+
+This script evaluates flow model checkpoints that use:
+- Single-action output (NOT trajectory-based)
+- ScoreNet with input_dim=obs_dim+act_dim, output_dim=act_dim
+- Flow Matching mode (marginal_prob_std=None)
+"""
 import os
 import os.path as osp
 import sys
@@ -14,83 +23,60 @@ sys.path.append(osp.abspath(osp.join(osp.dirname(__file__), '../../..')))
 import dsrl
 import dsrl.offline_safety_gymnasium
 
-from diffusion_SDE.model import ScoreNet, TwinQ
+from diffusion_SDE.model import ScoreNet
 
 
-def normalize_observation(mu_obs, std_obs, obs, EP=1e-6):
-    """Normalize observations using mean and std"""
-    if mu_obs is None:
-        return obs
-    if isinstance(obs, torch.Tensor):
-        mu = mu_obs.to(obs.device) if isinstance(mu_obs, torch.Tensor) else torch.tensor(mu_obs, device=obs.device, dtype=obs.dtype)
-        std = std_obs.to(obs.device) if isinstance(std_obs, torch.Tensor) else torch.tensor(std_obs, device=obs.device, dtype=obs.dtype)
-        return (obs - mu) / (std + EP)
-    else:
-        mu = mu_obs if not isinstance(mu_obs, torch.Tensor) else mu_obs.cpu().numpy()
-        std = std_obs if not isinstance(std_obs, torch.Tensor) else std_obs.cpu().numpy()
-        return (obs - mu) / (std + EP)
-
-
-@torch.no_grad()
-def evaluate_episode(env, model, device, norm_fn, diffusion_steps=15, horizon=5, act_dim=None, max_steps=1000, debug=False):
+def evaluate_episode(env, model, device, diffusion_steps=15, max_steps=1000, debug=False):
     """
-    Evaluate a single episode using the guided flow model.
-    Returns: (total_reward, total_cost, episode_length)
+    Evaluate a single episode using the single-action flow model.
+    
+    Args:
+        env: Gymnasium environment
+        model: ScoreNet flow model
+        device: torch device
+        diffusion_steps: Number of ODE integration steps
+        max_steps: Maximum episode length
+        debug: Print debug info
+        
+    Returns:
+        (total_reward, total_cost, episode_length)
     """
     model.eval()
     
     obs, _ = env.reset()
-    obs_tensor = torch.as_tensor(norm_fn(obs), dtype=torch.float32, device=device).unsqueeze(0)
     
     total_reward = 0.0
     total_cost = 0.0
     episode_len = 0
     done = False
     
-    if act_dim is None:
-        act_dim = env.action_space.shape[0]
-    
     if debug:
         print(f"\nDebug - Episode start:")
-        print(f"  obs shape: {obs.shape}, obs: {obs[:5]}")
-        print(f"  obs_tensor shape: {obs_tensor.shape}")
-        print(f"  act_dim: {act_dim}, horizon: {horizon}")
+        print(f"  obs shape: {obs.shape}, obs[:5]: {obs[:5]}")
     
     while not done and episode_len < max_steps:
         try:
-            # Use model.sample() which uses proper RK4 ODE solver
-            # Returns: [num_states, sample_per_state, output_dim]
-            actions = model.sample(
-                states=obs_tensor.cpu().numpy(),
-                sample_per_state=1,
-                diffusion_steps=diffusion_steps,
-                is_numpy=True
-            )
+            # Use select_actions which handles conditioning and ODE integration
+            # Returns single action directly (no trajectory extraction needed)
+            action = model.select_actions(obs, diffusion_steps=diffusion_steps)
             
-            # Extract single action: [1, 1, horizon*act_dim] -> [horizon, act_dim]
-            traj_flat = actions[0, 0, :]  # shape: [horizon * act_dim]
-            traj = traj_flat.reshape(horizon, act_dim)
-            action = traj[0]  # First action in trajectory
+            # select_actions returns numpy array directly
+            if isinstance(action, list):
+                action = action[0]
             
             if debug and episode_len < 3:
                 print(f"\nDebug - Step {episode_len}:")
-                print(f"  traj_flat shape: {traj_flat.shape}")
-                print(f"  traj shape: {traj.shape}")
-                print(f"  action shape: {action.shape}")
+                print(f"  action shape: {action.shape if hasattr(action, 'shape') else len(action)}")
                 print(f"  action: {action}")
-                print(f"  action range: [{action.min():.3f}, {action.max():.3f}]")
             
             # Step environment
             next_obs, reward, terminated, truncated, info = env.step(action)
             
             if debug and episode_len < 3:
-                print(f"  reward: {reward:.4f}, terminated: {terminated}, truncated: {truncated}")
-                print(f"  cost: {info.get('cost', 0.0):.4f}")
+                print(f"  reward: {reward:.4f}, cost: {info.get('cost', 0.0):.4f}")
             
-            # Update observation
-            obs_tensor = torch.as_tensor(norm_fn(next_obs), dtype=torch.float32, device=device).unsqueeze(0)
-            
-            # Accumulate metrics
+            # Update for next step
+            obs = next_obs
             total_reward += reward
             total_cost += info.get("cost", 0.0)
             episode_len += 1
@@ -108,57 +94,82 @@ def evaluate_episode(env, model, device, norm_fn, diffusion_steps=15, horizon=5,
     return total_reward, total_cost, episode_len
 
 
-def load_model_checkpoint(checkpoint_path, obs_dim, act_dim, horizon, device):
+def load_model_checkpoint(checkpoint_path, obs_dim, act_dim, device):
     """
-    Load a guided flow model checkpoint.
-    Note: Q and V networks were used during TRAINING to guide the loss,
-    but are NOT needed during evaluation - the flow model learned the guided policy.
-    """
-    # Create model architecture
-    traj_dim = horizon * act_dim
+    Load a V5_hist flow model checkpoint.
     
+    Args:
+        checkpoint_path: Path to the .pt checkpoint file
+        obs_dim: Observation dimension
+        act_dim: Action dimension
+        device: torch device
+        
+    Returns:
+        Loaded ScoreNet model
+    """
     # Create dummy args object with necessary attributes
     class Args:
         def __init__(self):
             self.device = device
-            self.schedule = 'linear'
+            self.schedule = 'linear'  # Required but unused in FM mode
     
     args = Args()
     
-    # Initialize model (Flow Matching mode: marginal_prob_std=None)
+    # V5_hist uses single-action output (NOT trajectory-based)
     model = ScoreNet(
-        input_dim=obs_dim + traj_dim,
-        output_dim=traj_dim,
-        marginal_prob_std=None,  # Flow Matching mode
+        input_dim=obs_dim + act_dim,  # Condition on obs, predict action
+        output_dim=act_dim,            # Single action output
+        marginal_prob_std=None,        # Flow Matching mode
         args=args
     ).to(device)
     
     # Load checkpoint
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(checkpoint)
-    model.eval()
     
+    # Handle both full model and state_dict saves
+    if isinstance(checkpoint, dict) and 'q_network.q1.0.weight' not in str(checkpoint.keys()):
+        # It's a state_dict
+        model.load_state_dict(checkpoint)
+    elif hasattr(checkpoint, 'state_dict'):
+        # It's a full model, extract state_dict
+        model.load_state_dict(checkpoint.state_dict())
+    else:
+        # Try loading directly (might be state_dict already)
+        try:
+            model.load_state_dict(checkpoint)
+        except:
+            # Last resort: it might be the full model saved
+            model = checkpoint
+            model.to(device)
+    
+    model.eval()
     return model
 
 
-def find_model_checkpoints(log_dir, step_interval=20000):
+def find_model_checkpoints(log_dir, step_interval=2000):
     """
     Find all flow model checkpoints at specified intervals.
-    Returns list of (step_number, checkpoint_path) tuples.
+    
+    Args:
+        log_dir: Directory containing torch_save folder
+        step_interval: Evaluate models at this step interval
+        
+    Returns:
+        List of (step_number, checkpoint_path) tuples sorted by step
     """
-    # Check if there's a torch_save subdirectory
+    # Check for torch_save subdirectory
     torch_save_dir = osp.join(log_dir, "torch_save")
     if osp.exists(torch_save_dir):
         search_dir = torch_save_dir
         print(f"Found torch_save directory: {torch_save_dir}")
     else:
         search_dir = log_dir
+        print(f"No torch_save directory, searching in: {log_dir}")
     
-    # Try different possible naming patterns
+    # Find flow model checkpoints
     patterns = [
         "flow_model_*.pt",
-        "flow_*.pt", 
-        "*flow*.pt"
+        "flow_*.pt",
     ]
     
     flow_models = []
@@ -170,24 +181,26 @@ def find_model_checkpoints(log_dir, step_interval=20000):
     flow_models = list(set(flow_models))
     
     if not flow_models:
-        print(f"Debug: No flow models found in {search_dir}")
-        print(f"Debug: Listing all .pt files in directory:")
+        print(f"No flow models found in {search_dir}")
+        print(f"Listing all .pt files:")
         all_pt_files = glob.glob(osp.join(search_dir, "*.pt"))
-        for f in all_pt_files[:10]:  # Show first 10 files
+        for f in all_pt_files[:15]:
             print(f"  {osp.basename(f)}")
         return []
     
     checkpoints = []
     for model_path in flow_models:
-        # Extract step number from filename
         basename = osp.basename(model_path)
-        # Try different patterns: flow_model_XXXXXX.pt, flow_XXXXXX.pt, etc.
+        
+        # Skip best/final models for interval-based evaluation
+        if 'best' in basename or 'final' in basename:
+            continue
+        
         try:
-            # Remove .pt extension first
+            # Extract step number: flow_model_XXXXXX.pt or flow_XXXXXX.pt
             name_without_ext = basename.replace(".pt", "")
-            
-            # Try to extract number from the end
             parts = name_without_ext.split("_")
+            
             for part in reversed(parts):
                 if part.isdigit():
                     step = int(part)
@@ -202,8 +215,8 @@ def find_model_checkpoints(log_dir, step_interval=20000):
     checkpoints.sort(key=lambda x: x[0])
     
     if not checkpoints:
-        print(f"Debug: Found {len(flow_models)} flow models but none match interval {step_interval}")
-        print(f"Debug: Sample filenames:")
+        print(f"Found {len(flow_models)} flow models but none match interval {step_interval}")
+        print("Sample filenames:")
         for model_path in flow_models[:5]:
             print(f"  {osp.basename(model_path)}")
     
@@ -215,17 +228,27 @@ def evaluate_all_checkpoints(
     log_dir,
     num_episodes=10,
     diffusion_steps=15,
-    horizon=5,
-    step_interval=20000,
+    step_interval=2000,
     device='cpu',
-    normalize_obs=False,
     max_episode_steps=1000
 ):
     """
     Evaluate all checkpoints for a given task.
+    
+    Args:
+        task_name: DSRL task name
+        log_dir: Directory containing checkpoints
+        num_episodes: Episodes per checkpoint
+        diffusion_steps: ODE integration steps
+        step_interval: Checkpoint interval to evaluate
+        device: torch device
+        max_episode_steps: Max steps per episode
+        
+    Returns:
+        List of result dictionaries
     """
     print(f"\n{'='*80}")
-    print(f"Evaluating GUIDED FLOW task: {task_name}")
+    print(f"Evaluating V5_HIST task: {task_name}")
     print(f"Log directory: {log_dir}")
     print(f"Device: {device}")
     print(f"{'='*80}\n")
@@ -238,83 +261,15 @@ def evaluate_all_checkpoints(
     print(f"Environment: {task_name}")
     print(f"  Observation dim: {obs_dim}")
     print(f"  Action dim: {act_dim}")
-    print(f"  Horizon: {horizon}")
     print(f"  Diffusion steps: {diffusion_steps}\n")
     
-    # Setup normalization (if needed)
-    mu_obs, std_obs = None, None
-    if normalize_obs:
-        # Try to load normalization statistics from log directory
-        norm_file = osp.join(log_dir, "norm_stats.json")
-        if osp.exists(norm_file):
-            with open(norm_file, 'r') as f:
-                norm_stats = json.load(f)
-                mu_obs = torch.tensor(norm_stats['mu'], dtype=torch.float32)
-                std_obs = torch.tensor(norm_stats['std'], dtype=torch.float32)
-            print(f"Loaded normalization stats from {norm_file}")
-        else:
-            print(f"Warning: Normalization requested but {norm_file} not found. Using unnormalized observations.")
-    
-    norm_fn = lambda obs: normalize_observation(mu_obs, std_obs, obs)
-    
-    # Find all checkpoints
+    # Find checkpoints
     checkpoints = find_model_checkpoints(log_dir, step_interval=step_interval)
     
     if len(checkpoints) == 0:
         print(f"\n{'!'*80}")
-        print(f"ERROR: No checkpoints found at interval {step_interval} in:")
-        print(f"  {log_dir}")
-        print(f"\nTrying to diagnose the issue...")
+        print(f"ERROR: No checkpoints found at interval {step_interval}")
         print(f"{'!'*80}\n")
-        
-        # Check for torch_save subdirectory
-        torch_save_dir = osp.join(log_dir, "torch_save")
-        if osp.exists(torch_save_dir):
-            search_dir = torch_save_dir
-            print(f"Checking torch_save directory: {torch_save_dir}")
-        else:
-            search_dir = log_dir
-            print(f"No torch_save directory found, checking main directory: {log_dir}")
-        
-        # List all .pt files to help debug
-        all_pt_files = glob.glob(osp.join(search_dir, "*.pt"))
-        print(f"\nTotal .pt files found: {len(all_pt_files)}")
-        
-        if len(all_pt_files) > 0:
-            print(f"\nShowing all .pt files (up to 20):")
-            for i, f in enumerate(all_pt_files[:20]):
-                print(f"  [{i+1}] {osp.basename(f)}")
-            
-            # Try to extract step numbers from all files
-            print(f"\nAttempting to extract step numbers:")
-            step_info = []
-            for f in all_pt_files:
-                basename = osp.basename(f)
-                name_without_ext = basename.replace(".pt", "")
-                parts = name_without_ext.split("_")
-                for part in reversed(parts):
-                    if part.isdigit():
-                        step_info.append((int(part), basename))
-                        break
-            
-            if step_info:
-                step_info.sort()
-                print(f"\nExtracted steps from all models:")
-                for step, name in step_info[:20]:
-                    is_interval = "✓" if step % step_interval == 0 else "✗"
-                    print(f"  {is_interval} Step {step:>7d}: {name}")
-                
-                # Find closest matching steps
-                matching_steps = [s for s, _ in step_info if s % step_interval == 0]
-                if matching_steps:
-                    print(f"\nSteps that match interval {step_interval}: {matching_steps}")
-                else:
-                    print(f"\nNo steps match the interval {step_interval}")
-                    print(f"Available steps: {[s for s, _ in step_info[:10]]}")
-        else:
-            print(f"\nNo .pt files found in directory!")
-            print(f"Please verify the log directory path is correct.")
-        
         return []
     
     print(f"Found {len(checkpoints)} checkpoints to evaluate:")
@@ -334,7 +289,6 @@ def evaluate_all_checkpoints(
                 checkpoint_path=checkpoint_path,
                 obs_dim=obs_dim,
                 act_dim=act_dim,
-                horizon=horizon,
                 device=device
             )
             
@@ -344,17 +298,15 @@ def evaluate_all_checkpoints(
             lengths = []
             
             for ep in range(num_episodes):
-                env.reset(seed=ep)  # Different seed for each episode
-                # Enable debug for first episode of first checkpoint
+                env.reset(seed=ep)
+                # Debug first episode of first checkpoint
                 debug = (ep == 0 and step == checkpoints[0][0])
+                
                 reward, cost, length = evaluate_episode(
                     env=env,
                     model=model,
                     device=device,
-                    norm_fn=norm_fn,
                     diffusion_steps=diffusion_steps,
-                    horizon=horizon,
-                    act_dim=act_dim,
                     max_steps=max_episode_steps,
                     debug=debug
                 )
@@ -364,26 +316,22 @@ def evaluate_all_checkpoints(
                 lengths.append(length)
             
             # Compute statistics
-            mean_reward = np.mean(rewards)
-            std_reward = np.std(rewards)
-            mean_cost = np.mean(costs)
-            std_cost = np.std(costs)
-            mean_length = np.mean(lengths)
-            
             result = {
                 'step': step,
-                'mean_reward': mean_reward,
-                'std_reward': std_reward,
-                'mean_cost': mean_cost,
-                'std_cost': std_cost,
-                'mean_length': mean_length,
+                'mean_reward': np.mean(rewards),
+                'std_reward': np.std(rewards),
+                'mean_cost': np.mean(costs),
+                'std_cost': np.std(costs),
+                'mean_length': np.mean(lengths),
                 'all_rewards': rewards,
                 'all_costs': costs,
                 'all_lengths': lengths
             }
             results.append(result)
             
-            print(f"  Step {step}: Reward={mean_reward:.2f}±{std_reward:.2f}, Cost={mean_cost:.2f}±{std_cost:.2f}, Length={mean_length:.1f}")
+            print(f"  Step {step}: Reward={result['mean_reward']:.2f}±{result['std_reward']:.2f}, "
+                  f"Cost={result['mean_cost']:.2f}±{result['std_cost']:.2f}, "
+                  f"Length={result['mean_length']:.1f}")
             
         except Exception as e:
             print(f"  Error evaluating checkpoint at step {step}: {e}")
@@ -396,8 +344,7 @@ def evaluate_all_checkpoints(
 
 
 def save_results(results, output_path):
-    """Save evaluation results to JSON file"""
-    # Convert numpy types to Python native types for JSON serialization
+    """Save evaluation results to JSON file."""
     results_serializable = []
     for result in results:
         result_copy = result.copy()
@@ -416,13 +363,13 @@ def save_results(results, output_path):
 
 
 def print_summary(results):
-    """Print summary table of results"""
+    """Print summary table of results."""
     if len(results) == 0:
         print("No results to display.")
         return
     
     print("\n" + "="*80)
-    print("GUIDED FLOW EVALUATION SUMMARY")
+    print("V5_HIST EVALUATION SUMMARY")
     print("="*80)
     print(f"{'Step':<12} {'Mean Reward':<20} {'Mean Cost':<20} {'Length':<12}")
     print("-"*80)
@@ -445,7 +392,7 @@ def print_summary(results):
 def main():
     import argparse
     
-    parser = argparse.ArgumentParser(description="Evaluate saved Guided Flow Matching models")
+    parser = argparse.ArgumentParser(description="Evaluate V5_hist Flow Matching model checkpoints")
     
     # Task selection
     parser.add_argument("--task", type=str, 
@@ -460,11 +407,11 @@ def main():
                        help="Base log directory")
     
     parser.add_argument("--experiment_subdir", type=str,
-                       default="IPLV6/ipl_twinq_nograd_sigmoid",
+                       default="twinq_fixed_hist",
                        help="Experiment subdirectory path")
     
-    parser.add_argument("--seed_dir", type=str, default="/home/me22b018/safe_diff/offline_mpc/logs/merged/OfflineSwimmerVelocityGymnasium-v1/IPLV6/ipl_twinq_nograd_sigmoid_no_w/OfflineSwimmerVelocityGymnasium-v1/ipl_flow_single_step_fixed_v6_with_viz/seed-003-2026-01-04-22-03-56",
-                       help="Specific seed directory to evaluate (optional, overrides auto-detection)")
+    parser.add_argument("--seed_dir", type=str, default=None,
+                       help="Specific seed directory to evaluate (overrides auto-detection)")
     
     # Evaluation parameters
     parser.add_argument("--num_episodes", type=int, default=10,
@@ -473,21 +420,15 @@ def main():
     parser.add_argument("--diffusion_steps", type=int, default=15,
                        help="Number of ODE integration steps")
     
-    parser.add_argument("--horizon", type=int, default=5,
-                       help="Planning horizon")
-    
-    parser.add_argument("--step_interval", type=int, default=20000,
+    parser.add_argument("--step_interval", type=int, default=2000,
                        help="Evaluate models at this step interval")
     
     parser.add_argument("--max_episode_steps", type=int, default=1000,
                        help="Maximum steps per episode")
     
-    # Device and normalization
+    # Device
     parser.add_argument("--device", type=str, default="cpu",
                        help="Device to run evaluation on (cpu or cuda)")
-    
-    parser.add_argument("--normalize_observation", action="store_true",
-                       help="Normalize observations (requires norm_stats.json)")
     
     # Output
     parser.add_argument("--output_file", type=str, default=None,
@@ -498,67 +439,67 @@ def main():
     # Expand home directory
     base_log_dir = osp.expanduser(args.base_log_dir)
     
-    # Check if specific seed directory is provided
+    # Determine log directory
     if args.seed_dir:
-        # Use the provided seed directory directly
+        # Use provided seed directory directly
         run_dir = osp.expanduser(args.seed_dir)
         print(f"Using specified seed directory: {run_dir}")
     else:
         # Auto-detect: Construct full log directory path
+        # V5_hist uses algorithm name: ipl_flow_twinq_fm_v5_fixed
         log_dir = osp.join(
             base_log_dir,
             args.task,
             args.experiment_subdir,
             args.task,
-            "ipl_flow_single_step_fixed_v6_with_viz"
+            "ipl_flow_twinq_fm_v5_fixed"
         )
         
-        # Find the specific run directory (should contain torch_save subdirectory with flow_model_*.pt files)
-        # Look for subdirectories matching the pattern seed-XXX-*
+        # Find seed directories
         run_dirs = glob.glob(osp.join(log_dir, "seed-*"))
         
         if len(run_dirs) == 0:
             print(f"Error: No run directories found in {log_dir}")
-            return
+            print(f"\nSearching for alternative paths...")
+            
+            # Try without task repetition
+            alt_log_dir = osp.join(
+                base_log_dir,
+                args.task,
+                args.experiment_subdir,
+                "ipl_flow_twinq_fm_v5_fixed"
+            )
+            run_dirs = glob.glob(osp.join(alt_log_dir, "seed-*"))
+            
+            if len(run_dirs) == 0:
+                print(f"Also tried: {alt_log_dir}")
+                print("No seed directories found. Please specify --seed_dir explicitly.")
+                return
         
-        # Use the most recent run directory
+        # Use most recent run directory
         run_dirs.sort()
         run_dir = run_dirs[-1]
-        
         print(f"Using run directory: {run_dir}")
     
-    # Check for torch_save subdirectory
-    torch_save_dir = osp.join(run_dir, "torch_save")
-    if osp.exists(torch_save_dir):
-        log_dir = torch_save_dir
-        print(f"Found torch_save directory: {torch_save_dir}")
-    else:
-        log_dir = run_dir
-        print(f"Warning: No torch_save directory found, using: {run_dir}")
-    
     # Check if directory exists
-    if not osp.exists(log_dir):
-        print(f"Error: Log directory does not exist: {log_dir}")
+    if not osp.exists(run_dir):
+        print(f"Error: Directory does not exist: {run_dir}")
         return
     
     # Determine output file
     if args.output_file is None:
-        # Save in the run directory (parent of torch_save)
-        output_dir = run_dir
-        output_file = osp.join(output_dir, f"eval_guided_results_step{args.step_interval}.json")
+        output_file = osp.join(run_dir, f"eval_V5_hist_results_step{args.step_interval}.json")
     else:
         output_file = args.output_file
     
     # Run evaluation
     results = evaluate_all_checkpoints(
         task_name=args.task,
-        log_dir=log_dir,
+        log_dir=run_dir,
         num_episodes=args.num_episodes,
         diffusion_steps=args.diffusion_steps,
-        horizon=args.horizon,
         step_interval=args.step_interval,
         device=args.device,
-        normalize_obs=args.normalize_observation,
         max_episode_steps=args.max_episode_steps
     )
     
