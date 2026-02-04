@@ -176,7 +176,7 @@ class ScoreBase(nn.Module):
         raise NotImplementedError
 
 
-    def select_actions(self, states, diffusion_steps=15):
+    def select_actions(self, states, diffusion_steps=15, prev_actions=None):
         multiple_input = True
         with torch.no_grad():
             if not isinstance(states, torch.Tensor):
@@ -190,10 +190,23 @@ class ScoreBase(nn.Module):
                 multiple_input = False
             num_states = states.shape[0]
 
+            # Build condition: [obs, prev_action] if use_prev_action enabled
+            if getattr(self, 'use_prev_action', False):
+                if prev_actions is None:
+                    prev_actions = torch.zeros(num_states, self.act_dim, device=self.device)
+                elif not isinstance(prev_actions, torch.Tensor):
+                    prev_actions = torch.FloatTensor(prev_actions).to(self.device)
+                else:
+                    prev_actions = prev_actions.to(self.device)
+                if prev_actions.dim() == 1:
+                    prev_actions = prev_actions.unsqueeze(0)
+                condition = torch.cat([states, prev_actions], dim=-1)
+            else:
+                condition = states
 
 # If in diffusion mode, use DPM-Solver
             if self.marginal_prob_std is not None:
-                self.condition = states
+                self.condition = condition
                 self.maybe_init_dpm_solver()
                 if self.dpm_solver is None:
                     raise RuntimeError("DPM solver not initialized; cannot sample.")
@@ -204,7 +217,7 @@ class ScoreBase(nn.Module):
 # Flow Matching mode: perform simple Euler integration of the learned vector field.
 # IMPORTANT: This is a simple fallback sampler for quick testing. For accurate sampling, integrate the ODE using
 # a proper ODE solver (e.g., RK4 or adaptive solvers) with v_theta as the vector field.
-                self.condition = states
+                self.condition = condition
                 B = states.shape[0]
                 D = self.output_dim  # flattened trajectory dimension (H * act_dim)
 
@@ -243,7 +256,7 @@ class ScoreBase(nn.Module):
         return out_actions
 
 
-    def sample_and_logprob(self, states, diffusion_steps=15, hutchinson_samples=1):
+    def sample_and_logprob(self, states, diffusion_steps=15, hutchinson_samples=1, prev_actions=None):
         """
         Sample actions and compute log-probability for SAC-style entropy.
         Uses OT flow matching with Hutchinson trace estimator for divergence.
@@ -252,6 +265,7 @@ class ScoreBase(nn.Module):
             states: [B, obs_dim] conditioning states
             diffusion_steps: number of Euler steps for ODE integration
             hutchinson_samples: number of random vectors for trace estimation
+            prev_actions: [B, act_dim] previous actions (optional, used if use_prev_action=True)
         
         Returns:
             actions: [B, act_dim] sampled actions (detached)
@@ -269,6 +283,20 @@ class ScoreBase(nn.Module):
         B = states.shape[0]
         D = self.output_dim
         
+        # Build condition with prev_actions if enabled
+        if getattr(self, 'use_prev_action', False):
+            if prev_actions is None:
+                prev_actions = torch.zeros(B, self.act_dim, device=self.device)
+            elif not isinstance(prev_actions, torch.Tensor):
+                prev_actions = torch.FloatTensor(prev_actions).to(self.device)
+            else:
+                prev_actions = prev_actions.to(self.device).detach()
+            if prev_actions.dim() == 1:
+                prev_actions = prev_actions.unsqueeze(0)
+            condition = torch.cat([states, prev_actions], dim=-1)
+        else:
+            condition = states
+        
         # Initial sample from base distribution: x0 ~ N(0, I)
         x = torch.randn(B, D, device=self.device)
         
@@ -276,7 +304,7 @@ class ScoreBase(nn.Module):
         log_p = -0.5 * (x ** 2).sum(dim=-1) - 0.5 * D * np.log(2 * np.pi)
         
         dt = 1.0 / diffusion_steps
-        self.condition = states
+        self.condition = condition
         
         # Enable gradients for Hutchinson estimator even if called inside no_grad context
         with torch.enable_grad():
@@ -308,7 +336,7 @@ class ScoreBase(nn.Module):
         self.condition = None
         return x.detach(), log_p.detach()
 
-    def sample_and_logprob_fast(self, states, diffusion_steps=10):
+    def sample_and_logprob_fast(self, states, diffusion_steps=10, prev_actions=None):
         """
         Fast approximate sampling with log-prob.
         Uses simple approximation: logp ≈ -0.5 * ||x0||^2 (ignores Jacobian)
@@ -317,6 +345,7 @@ class ScoreBase(nn.Module):
         Args:
             states: [B, obs_dim] conditioning states
             diffusion_steps: number of Euler steps
+            prev_actions: [B, act_dim] previous actions (optional)
         
         Returns:
             actions: [B, act_dim] sampled actions
@@ -334,6 +363,20 @@ class ScoreBase(nn.Module):
             B = states.shape[0]
             D = self.output_dim
             
+            # Build condition with prev_actions if enabled
+            if getattr(self, 'use_prev_action', False):
+                if prev_actions is None:
+                    prev_actions = torch.zeros(B, self.act_dim, device=self.device)
+                elif not isinstance(prev_actions, torch.Tensor):
+                    prev_actions = torch.FloatTensor(prev_actions).to(self.device)
+                else:
+                    prev_actions = prev_actions.to(self.device)
+                if prev_actions.dim() == 1:
+                    prev_actions = prev_actions.unsqueeze(0)
+                condition = torch.cat([states, prev_actions], dim=-1)
+            else:
+                condition = states
+            
             # Sample from base distribution
             x0 = torch.randn(B, D, device=self.device)
             
@@ -342,7 +385,7 @@ class ScoreBase(nn.Module):
             
             x = x0
             dt = 1.0 / diffusion_steps
-            self.condition = states
+            self.condition = condition
             
             for step in range(diffusion_steps):
                 t = torch.full((B,), step * dt, device=self.device)
@@ -352,7 +395,7 @@ class ScoreBase(nn.Module):
             self.condition = None
             return x, log_p0
 
-    def sample_actions_fast(self, states, diffusion_steps=15):
+    def sample_actions_fast(self, states, diffusion_steps=15, prev_actions=None):
         """
         Fast action sampling without log-prob computation.
         Uses Euler integration for speed.
@@ -360,6 +403,7 @@ class ScoreBase(nn.Module):
         Args:
             states: [B, obs_dim] conditioning states
             diffusion_steps: number of Euler steps
+            prev_actions: [B, act_dim] previous actions (optional)
         
         Returns:
             actions: [B, act_dim] sampled actions
@@ -376,11 +420,25 @@ class ScoreBase(nn.Module):
             B = states.shape[0]
             D = self.output_dim
             
+            # Build condition with prev_actions if enabled
+            if getattr(self, 'use_prev_action', False):
+                if prev_actions is None:
+                    prev_actions = torch.zeros(B, self.act_dim, device=self.device)
+                elif not isinstance(prev_actions, torch.Tensor):
+                    prev_actions = torch.FloatTensor(prev_actions).to(self.device)
+                else:
+                    prev_actions = prev_actions.to(self.device)
+                if prev_actions.dim() == 1:
+                    prev_actions = prev_actions.unsqueeze(0)
+                condition = torch.cat([states, prev_actions], dim=-1)
+            else:
+                condition = states
+            
             # Start from noise
             x = torch.randn(B, D, device=self.device)
             
             dt = 1.0 / diffusion_steps
-            self.condition = states
+            self.condition = condition
             
             for step in range(diffusion_steps):
                 t = torch.full((B,), step * dt, device=self.device)
@@ -449,11 +507,25 @@ class ScoreBase(nn.Module):
 
 
 class ScoreNet(ScoreBase):
-    def __init__(self, input_dim, output_dim, marginal_prob_std, embed_dim=32, **kwargs):
+    def __init__(self, input_dim, output_dim, marginal_prob_std, embed_dim=128, cond_dim=32, use_prev_action=False, **kwargs):
         super().__init__(input_dim, output_dim, marginal_prob_std, embed_dim, **kwargs)
-        self.pre_sort_condition = nn.Sequential(Dense(input_dim-output_dim, 32), SiLU())
+        
+        # Store dimensions
+        self.cond_dim = cond_dim
+        self.time_embed_dim = embed_dim
+        self.use_prev_action = use_prev_action
+        self.act_dim = output_dim
+        
+        # Condition encoder: (obs_dim + prev_act_dim) → cond_dim if use_prev_action else obs_dim → cond_dim
+        obs_dim = input_dim - output_dim
+        self.obs_dim = obs_dim
+        cond_input_dim = obs_dim + output_dim if use_prev_action else obs_dim
+        self.pre_sort_condition = nn.Sequential(Dense(cond_input_dim, cond_dim), SiLU())
+        
+        # Combined embedding: cond_dim + embed_dim
+        combined_dim = cond_dim + embed_dim
         self.sort_t = nn.Sequential(
-            nn.Linear(64, 128),
+            nn.Linear(combined_dim, 128),  # Dynamic input size
             SiLU(),
             nn.Linear(128, 128),
         )

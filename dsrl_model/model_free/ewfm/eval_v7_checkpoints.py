@@ -39,13 +39,17 @@ def find_checkpoints(ckpt_dir):
 
 
 @torch.no_grad()
-def evaluate_episode(env, flow_model, device, mu_obs=None, std_obs=None):
+def evaluate_episode(env, flow_model, device, mu_obs=None, std_obs=None, use_prev_action=False):
     """Run single episode, return (reward, cost, length)."""
     obs, _ = env.reset()
     obs = np.asarray(obs, dtype=np.float32)
     
     total_reward, total_cost, length = 0.0, 0.0, 0
     done = False
+    
+    # Initialize prev_action tracking
+    act_dim = flow_model.act_dim
+    prev_action = torch.zeros(1, act_dim, device=device) if use_prev_action else None
     
     while not done:
         if mu_obs is not None:
@@ -54,12 +58,18 @@ def evaluate_episode(env, flow_model, device, mu_obs=None, std_obs=None):
             obs_norm = obs
         obs_t = torch.as_tensor(obs_norm, dtype=torch.float32, device=device).unsqueeze(0)
         
-        action = flow_model.select_actions(obs_t)
+        action = flow_model.select_actions(obs_t, prev_actions=prev_action)
         # Force flatten to 1D numpy array
         if isinstance(action, torch.Tensor):
-            action = action.detach().cpu().numpy()
-        action = np.asarray(action).flatten()
-        next_obs, reward, terminated, truncated, info = env.step(action)
+            action_np = action.detach().cpu().numpy()
+        else:
+            action_np = action
+        action_np = np.asarray(action_np).flatten()
+        next_obs, reward, terminated, truncated, info = env.step(action_np)
+        
+        # Update prev_action for next step
+        if use_prev_action:
+            prev_action = torch.as_tensor(action_np, dtype=torch.float32, device=device).unsqueeze(0)
         
         obs = np.asarray(next_obs, dtype=np.float32)
         total_reward += reward
@@ -70,15 +80,27 @@ def evaluate_episode(env, flow_model, device, mu_obs=None, std_obs=None):
     return total_reward, total_cost, length
 
 
-def evaluate_checkpoint(ckpt_path, env, device, num_episodes, obs_dim, act_dim, args, mu_obs=None, std_obs=None):
+def evaluate_checkpoint(ckpt_path, env, device, num_episodes, obs_dim, act_dim, args, mu_obs=None, std_obs=None, use_prev_action=False):
     """Evaluate single checkpoint."""
-    flow_model = ScoreNet(obs_dim + act_dim, act_dim, marginal_prob_std=None, args=args).to(device)
+    # Get embed_dim and cond_dim from args (loaded from config)
+    
+    embed_dim = getattr(args, 'embed_dim', 128)
+    cond_dim = getattr(args, 'cond_dim', 32)
+    
+    flow_model = ScoreNet(
+        obs_dim + act_dim, act_dim, 
+        marginal_prob_std=None, 
+        embed_dim=embed_dim,
+        cond_dim=cond_dim,
+        use_prev_action=use_prev_action,
+        args=args
+    ).to(device)
     flow_model.load_state_dict(torch.load(ckpt_path, map_location=device, weights_only=True))
     flow_model.eval()
     
     rewards, costs, lengths = [], [], []
     for _ in range(num_episodes):
-        r, c, l = evaluate_episode(env, flow_model, device, mu_obs, std_obs)
+        r, c, l = evaluate_episode(env, flow_model, device, mu_obs, std_obs, use_prev_action=use_prev_action)
         rewards.append(r)
         costs.append(c)
         lengths.append(l)
@@ -100,6 +122,7 @@ def main():
     parser.add_argument("--task", type=str, default=None)
     parser.add_argument("--num_episodes", type=int, default=10)
     parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--use_prev_action", action="store_true", default=False, help="Condition flow on previous action")
     args = parser.parse_args()
     
     device = torch.device(args.device)
@@ -119,6 +142,9 @@ def main():
         args.schedule = "Linear"
     if not hasattr(args, 'normalize_observation'):
         args.normalize_observation = False
+    # Override use_prev_action from config if not set via CLI
+    if not args.use_prev_action:
+        args.use_prev_action = train_config.get('use_prev_action', False)
     
     task = args.task or train_config.get('task')
     if not task:
@@ -126,7 +152,7 @@ def main():
     
     normalize = getattr(args, 'normalize_observation', False)
     
-    print(f"Task: {task} | Device: {device} | Episodes: {args.num_episodes}")
+    print(f"Task: {task} | Device: {device} | Episodes: {args.num_episodes} | use_prev_action: {args.use_prev_action}")
     
     checkpoints = find_checkpoints(args.ckpt_dir)
     if not checkpoints:
@@ -166,7 +192,7 @@ def main():
     start = time.time()
     
     for i, (itr, path) in enumerate(checkpoints):
-        res = evaluate_checkpoint(path, env, device, args.num_episodes, obs_dim, act_dim, args, mu_obs, std_obs)
+        res = evaluate_checkpoint(path, env, device, args.num_episodes, obs_dim, act_dim, args, mu_obs, std_obs, use_prev_action=args.use_prev_action)
         results[itr] = res
         print(f"[{i+1}/{len(checkpoints)}] iter={itr}: R={res['reward_mean']:.1f}±{res['reward_std']:.1f} C={res['cost_mean']:.1f} ±{res['cost_std']:.1f}")
     

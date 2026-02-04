@@ -80,6 +80,8 @@ default_cfg = {
     "auto_tune_alpha": True,
     "alpha_lr": 3e-4,
     "diffusion_steps": 10,  # ODE steps for sampling
+    # Previous action conditioning
+    "use_prev_action": False,  # If True, condition policy on [obs, prev_action]
 }
 
 
@@ -189,8 +191,12 @@ class VNetwork(nn.Module):
         return self.net(s).squeeze(-1)
 
 
-def sample_segment_batch_fast(neg_obs, neg_act, union_obs, union_act, buffers):
-    """Optimized segment sampling with pre-computed offsets"""
+def sample_segment_batch_fast(neg_obs, neg_act, union_obs, union_act, buffers, return_prev_actions=False):
+    """Optimized segment sampling with pre-computed offsets
+    
+    Args:
+        return_prev_actions: If True, include 'prev_a' in returned dicts
+    """
     B = buffers.batch_size
     k = buffers.segment_len
     offsets = buffers.offsets_seg
@@ -220,10 +226,21 @@ def sample_segment_batch_fast(neg_obs, neg_act, union_obs, union_act, buffers):
     union_a = union_act[idx_union_exp, union_time_idx]
     union_s_next = union_obs[idx_union_exp, union_time_next]
 
-    return {
+    result = {
         'neg': {'s': neg_s.transpose(0, 1), 'a': neg_a.transpose(0, 1), 's_next': neg_s_next.transpose(0, 1)},
         'union': {'s': union_s.transpose(0, 1), 'a': union_a.transpose(0, 1), 's_next': union_s_next.transpose(0, 1)}
     }
+    
+    if return_prev_actions:
+        # Compute prev_a: shift actions, pad first with zeros
+        neg_prev_a = torch.zeros_like(neg_a)
+        neg_prev_a[:, 1:, :] = neg_a[:, :-1, :]
+        union_prev_a = torch.zeros_like(union_a)
+        union_prev_a[:, 1:, :] = union_a[:, :-1, :]
+        result['neg']['prev_a'] = neg_prev_a.transpose(0, 1)
+        result['union']['prev_a'] = union_prev_a.transpose(0, 1)
+    
+    return result
 
 
 def sample_transitions_fast(union_obs, union_act, batch_size, device):
@@ -234,8 +251,13 @@ def sample_transitions_fast(union_obs, union_act, batch_size, device):
     return union_obs[idx, t_idx], union_act[idx, t_idx]
 
 
-def sample_flow_segments_fast(union_obs, union_act, buffers, horizon=None):
-    """Optimized flow segment sampling with pre-computed offsets"""
+def sample_flow_segments_fast(union_obs, union_act, buffers, horizon=None, return_prev_actions=False):
+    """Optimized flow segment sampling with pre-computed offsets
+    
+    Args:
+        return_prev_actions: If True, also return prev_actions [B, H, act_dim] where
+                             prev_a[:, 0, :] = 0 and prev_a[:, 1:, :] = act[:, :-1, :]
+    """
     B = buffers.batch_size
     H = horizon if horizon is not None else buffers.horizon
     offsets = buffers.offsets_flow[:, :H]
@@ -250,13 +272,23 @@ def sample_flow_segments_fast(union_obs, union_act, buffers, horizon=None):
     time_idx = start_idx.unsqueeze(1) + offsets
     traj_exp = traj_idx.unsqueeze(1).expand(-1, H)
     
-    return union_obs[traj_exp, time_idx], union_act[traj_exp, time_idx]
+    seg_s = union_obs[traj_exp, time_idx]
+    seg_a = union_act[traj_exp, time_idx]
+    
+    if not return_prev_actions:
+        return seg_s, seg_a
+    
+    # Compute prev_actions: shift actions by 1, pad first with zeros
+    # Shape: [B, H, act_dim]
+    prev_a = torch.zeros_like(seg_a)
+    prev_a[:, 1:, :] = seg_a[:, :-1, :]
+    return seg_s, seg_a, prev_a
 
 
 # ============== Loss Functions ==============
 
 def ipl_preference_loss(q_critic, flow_model, batch_seg, gamma, chi2_coeff, target_clip, act_dim, 
-                        alpha=0.1, diffusion_steps=10):
+                        alpha=0.1, diffusion_steps=10, use_prev_action=False):
     """
     Soft IPL preference loss with entropy-regularized inverse Bellman operator.
     Uses soft Q-target: Q(s',a') - α * log π(a'|s')
@@ -284,17 +316,23 @@ def ipl_preference_loss(q_critic, flow_model, batch_seg, gamma, chi2_coeff, targ
         qs = torch.stack([q1.squeeze(-1), q2.squeeze(-1)], dim=0)
 
     # Soft inverse Bellman: sample next actions with log-prob
+    # For next state, prev_action = current action (a_t becomes prev for s_{t+1})
     with torch.no_grad():
-        next_actions, logp_next = flow_model.sample_and_logprob(
-            next_obs_all, diffusion_steps=diffusion_steps
-        )
+        if use_prev_action:
+            next_actions, logp_next = flow_model.sample_and_logprob(
+                next_obs_all, diffusion_steps=diffusion_steps, prev_actions=act_all
+            )
+        else:
+            next_actions, logp_next = flow_model.sample_and_logprob(
+                next_obs_all, diffusion_steps=diffusion_steps
+            )
         q_next = q_critic.get_target_q(next_obs_all, next_actions).squeeze(-1)
         
         # Soft Q-target: Q(s',a') - α * log π(a'|s')
         soft_q_next = q_next - alpha * logp_next
         
         if target_clip:
-            q_lim = 1.0 / (chi2_coeff * (gamma + 1e-6))
+            q_lim = 10.0 / (chi2_coeff * (gamma + 1e-6))
             soft_q_next = soft_q_next.clamp(-q_lim, q_lim)
 
     # Soft reward = Q(s,a) - γ * soft_Q(s',a')
@@ -493,34 +531,41 @@ def train_flow_matching_step(flow_model, flow_optimizer, q_critic,
     return loss.item()
 
 
-def train_flow_step_segment(flow_model, flow_optimizer, scaler, q_critic, v_model,
+def train_flow_step_segment(flow_model, flow_optimizer, scaler, q_critic,
                             seg_s, seg_a, gamma_powers, buffers, config, use_guidance=True,
-                            alpha=0.1, in_warmup=False):
+                            alpha=0.1, in_warmup=False, seg_prev_a=None):
     """
     Flow policy training with optional SAC entropy bonus.
     During warmup: Pure FM loss (fast, stable)
     After warmup: SAC policy loss + FM regularization
+    
+    Args:
+        seg_prev_a: [B, H, act_dim] previous actions (optional, for prev_action conditioning)
     """
     flow_model.train()
     B, H, obs_dim = seg_s.shape
     act_dim = seg_a.shape[-1]
     device = seg_s.device
     sigma_min = config.get('sigma_min', 0.01)
+    use_prev_action = config.get('use_prev_action', False)
     N = B * H
     
     # Flatten segments: [B*H, dim]
     s_flat = seg_s.reshape(N, obs_dim)
     a_flat = seg_a.reshape(N, act_dim)
     
+    # Build condition: [obs] or [obs, prev_action]
+    if use_prev_action and seg_prev_a is not None:
+        prev_a_flat = seg_prev_a.reshape(N, act_dim)
+        cond_flat = torch.cat([s_flat, prev_a_flat], dim=-1)
+    else:
+        cond_flat = s_flat
+    
     # Compute segment weights (uniform during warmup)
     if use_guidance and not in_warmup:
         with torch.no_grad():
             q_val = q_critic(s_flat, a_flat).squeeze(-1)
-            if config.get('weight_from_q', False):
-                energy_flat = q_val
-            else:
-                v_val = v_model(s_flat)
-                energy_flat = q_val - v_val
+            energy_flat = q_val
             w_seg, A_seg = compute_segment_weights_jit(
                 energy_flat, gamma_powers, B, H, config.get('energy_alpha', 3.0)
             )
@@ -540,7 +585,7 @@ def train_flow_step_segment(flow_model, flow_optimizer, scaler, q_critic, v_mode
     flow_optimizer.zero_grad(set_to_none=True)
     
     with torch.cuda.amp.autocast():
-        v_theta = flow_model(x_t, t, condition=s_flat)
+        v_theta = flow_model(x_t, t, condition=cond_flat)
         fm_loss = compute_weighted_loss_jit(v_theta, u_t, w_seg, B, H)
     
     
@@ -555,20 +600,31 @@ def train_flow_step_segment(flow_model, flow_optimizer, scaler, q_critic, v_mode
 
 
 @torch.no_grad()
-def evaluate_flow_policy(eval_env, flow_model, device, norm_fn, diffusion_steps=15):
-    """Evaluate single-step policy"""
+def evaluate_flow_policy(eval_env, flow_model, device, norm_fn, diffusion_steps=15, act_dim=None):
+    """Evaluate single-step policy with optional prev_action conditioning"""
     obs, _ = eval_env.reset()
     obs = np.array(obs) if not isinstance(obs, np.ndarray) else obs
     obs = torch.as_tensor(norm_fn(obs), dtype=torch.float32, device=device).unsqueeze(0)
+    
+    # Track previous action for conditioning (if model uses it)
+    use_prev_action = getattr(flow_model, 'use_prev_action', False)
+    if act_dim is None:
+        act_dim = flow_model.output_dim
+    prev_action = torch.zeros(1, act_dim, device=device) if use_prev_action else None
     
     total_reward, total_cost, total_len = 0.0, 0.0, 0
     done = False
     
     while not done:
-        act = flow_model.select_actions(obs)
+        act = flow_model.select_actions(obs, diffusion_steps=diffusion_steps, prev_actions=prev_action)
         next_obs, reward, terminated, truncated, info = eval_env.step(act)
         next_obs = np.array(next_obs) if not isinstance(next_obs, np.ndarray) else next_obs
         obs = torch.as_tensor(norm_fn(next_obs), dtype=torch.float32, device=device).unsqueeze(0)
+        
+        # Update prev_action for next step
+        if use_prev_action:
+            act_np = act if isinstance(act, np.ndarray) else np.array(act)
+            prev_action = torch.as_tensor(act_np, dtype=torch.float32, device=device).unsqueeze(0)
         
         total_reward += reward
         total_cost += info.get('cost', 0.0)
@@ -647,21 +703,19 @@ def main(args):
     
     print("\nInitializing models...")
     q_critic = IPL_TwinQ_Critic(obs_dim=obs_dim, act_dim=act_dim, args=args).to(device)
-    
-    # V-network for advantage computation
-    v_model = VNetwork(obs_dim, hidden_size=config['v_hidden']).to(device)
-    
+
+    use_prev_action = config.get('use_prev_action', False)
     flow_model = ScoreNet(
         input_dim=obs_dim + act_dim,
         output_dim=act_dim,
         marginal_prob_std=None,
+        use_prev_action=use_prev_action,
         args=args
     ).to(device)
     
     # Fused optimizers for faster CUDA ops
     use_fused = device.type == 'cuda'
     q_opt = Adam(q_critic.parameters(), lr=config['q_lr'], weight_decay=config['weight_decay'], fused=use_fused)
-    v_opt = Adam(v_model.parameters(), lr=config['v_lr'], weight_decay=config['weight_decay'], fused=use_fused)
     flow_opt = Adam(flow_model.parameters(), lr=config['lr'], weight_decay=config['weight_decay'], fused=use_fused)
     
     # ========== SAC Alpha (Temperature) Infrastructure ==========
@@ -673,11 +727,10 @@ def main(args):
     # AMP GradScaler
     scaler = torch.cuda.amp.GradScaler()
     
-    logger.log(f"✅ TwinQ critic initialized: obs_dim={obs_dim}, act_dim={act_dim}")
-    logger.log(f"✅ V-network initialized: hidden_size={config['v_hidden']}")
-    logger.log(f"✅ Flow model: input_dim={obs_dim + act_dim}, output_dim={act_dim}")
-    logger.log(f"✅ SAC alpha: init={config['alpha']:.4f}, target_entropy={target_entropy:.2f}, auto_tune={auto_tune_alpha}")
-    logger.log(f"✅ AMP enabled with fused={use_fused}")
+    logger.log(f"TwinQ critic initialized: obs_dim={obs_dim}, act_dim={act_dim}")
+    logger.log(f"Flow model: input_dim={obs_dim + act_dim}, output_dim={act_dim}, use_prev_action={use_prev_action}")
+    logger.log(f"SAC alpha: init={config['alpha']:.4f}, target_entropy={target_entropy:.2f}, auto_tune={auto_tune_alpha}")
+    logger.log(f"AMP enabled with fused={use_fused}")
     
     # ============================================================
     # Joint Training: Q + Flow together
@@ -723,10 +776,16 @@ def main(args):
         # ========== Sample Data ==========
         # Segment batch for IPL (only after warmup)
         if not in_warmup:
-            batch_seg = sample_segment_batch_fast(neg_obs, neg_act, union_obs, union_act, buffers)
+            batch_seg = sample_segment_batch_fast(neg_obs, neg_act, union_obs, union_act, buffers,
+                                                   return_prev_actions=use_prev_action)
         
         # Flow segments from union data (use pre-allocated offsets)
-        seg_s, seg_a = sample_flow_segments_fast(union_obs, union_act, buffers, flow_horizon)
+        if use_prev_action:
+            seg_s, seg_a, seg_prev_a = sample_flow_segments_fast(union_obs, union_act, buffers, flow_horizon,
+                                                                  return_prev_actions=True)
+        else:
+            seg_s, seg_a = sample_flow_segments_fast(union_obs, union_act, buffers, flow_horizon)
+            seg_prev_a = None
         
         # ========== Q-Learning Step (skip during warmup) ==========
         if not in_warmup:
@@ -736,7 +795,8 @@ def main(args):
             q_loss, r_union_mean, r_neg_mean, logp_q = ipl_preference_loss(
                 q_critic, flow_model, batch_seg, 
                 config['gamma'], config['chi2_coeff'], config['target_clipping'], act_dim,
-                alpha=alpha, diffusion_steps=config.get('diffusion_steps', 10)
+                alpha=alpha, diffusion_steps=config.get('diffusion_steps', 10),
+                use_prev_action=use_prev_action
             )
 
             q_opt.zero_grad(set_to_none=True)
@@ -745,30 +805,22 @@ def main(args):
             q_opt.step()
             
             # ========== V-Network Step ==========
-            v_states, v_actions = sample_transitions_fast(union_obs, union_act, batch_size, device)
-            v_loss, v_mean = expectile_value_loss(
-                v_model, q_critic, v_states, v_actions, config['expectile_tau']
-            )
-            v_opt.zero_grad(set_to_none=True)
-            v_loss.backward()
-            clip_grad_norm_(v_model.parameters(), config["max_grad_norm"])
-            v_opt.step()
+            #REMOVED
             
             # Accumulate stats (no GPU sync)
             acc_q_loss += q_loss.detach()
             acc_r_union += r_union_mean.detach()
             acc_r_neg += r_neg_mean.detach()
-            acc_v_loss += v_loss.detach()
-            acc_v_mean += v_mean.detach()
+
         
         # ========== Flow Matching Step (segment-based) ==========
         use_flow_guidance = config['use_guidance'] and (not in_warmup)
         alpha_val = config['alpha']
         
         flow_loss, A_seg_mean, A_seg_std, w_seg_max = train_flow_step_segment(
-            flow_model, flow_opt, scaler, q_critic, v_model,
+            flow_model, flow_opt, scaler, q_critic,
             seg_s, seg_a, gamma_powers, buffers, config, use_guidance=use_flow_guidance,
-            alpha=alpha_val, in_warmup=in_warmup
+            alpha=alpha_val, in_warmup=in_warmup, seg_prev_a=seg_prev_a
         )
         acc_flow_loss += flow_loss.detach()
         acc_A_seg += A_seg_mean.detach()
@@ -791,8 +843,6 @@ def main(args):
             q_loss_avg = (acc_q_loss / n).item() if not in_warmup else 0.0
             r_union_avg = (acc_r_union / n).item() if not in_warmup else 0.0
             r_neg_avg = (acc_r_neg / n).item() if not in_warmup else 0.0
-            v_loss_avg = (acc_v_loss / n).item() if not in_warmup else 0.0
-            v_mean_avg = (acc_v_mean / n).item() if not in_warmup else 0.0
             flow_loss_avg = (acc_flow_loss / n).item()
             A_seg_avg = (acc_A_seg / n).item()
 
@@ -801,8 +851,6 @@ def main(args):
             acc_q_loss.zero_()
             acc_r_union.zero_()
             acc_r_neg.zero_()
-            acc_v_loss.zero_()
-            acc_v_mean.zero_()
             acc_flow_loss.zero_()
             acc_A_seg.zero_()
 
@@ -821,8 +869,6 @@ def main(args):
                 f"q_loss={q_loss_avg:.4f} "
                 f"r_union={r_union_avg:.3f} "
                 f"r_neg={r_neg_avg:.3f} | "
-                f"v_loss={v_loss_avg:.4f} "
-                f"v_mean={v_mean_avg:.3f} | "
                 f"flow_loss={flow_loss_avg:.6f} "
                 f"A_seg={A_seg_avg:.3f} | "
                 f"α={alpha_val:.4f} | "
@@ -835,8 +881,6 @@ def main(args):
             tb_writer.add_scalar('Joint/r_neg_mean', r_neg_avg, global_step)
             tb_writer.add_scalar('Joint/reward_gap', r_union_avg - r_neg_avg, global_step)
             tb_writer.add_scalar('Joint/flow_loss', flow_loss_avg, global_step)
-            tb_writer.add_scalar('Joint/v_loss', v_loss_avg, global_step)
-            tb_writer.add_scalar('Joint/v_mean', v_mean_avg, global_step)
             tb_writer.add_scalar('Flow/A_seg_mean', A_seg_avg, global_step)
             tb_writer.add_scalar('SAC/alpha', alpha_val, global_step)
             tb_writer.add_scalar('SAC/entropy', global_step)
@@ -844,13 +888,11 @@ def main(args):
         # ========== Checkpointing ==========
         if (step + 1) % config['save_freq'] == 0:
             logger.torch_save(itr=step+1, torch_saver_elements=q_critic, prefix="q_critic")
-            logger.torch_save(itr=step+1, torch_saver_elements=v_model, prefix="v_model")
             logger.torch_save(itr=step+1, torch_saver_elements=flow_model, prefix="flow")
     
     # ========== Final Save ==========
     logger.torch_save(itr=total_iters, torch_saver_elements=flow_model, prefix="flow_final")
     logger.torch_save(itr=total_iters, torch_saver_elements=q_critic, prefix="q_critic_final")
-    logger.torch_save(itr=total_iters, torch_saver_elements=v_model, prefix="v_model_final")
     
     logger.log("✅ Joint training complete!")
     
@@ -887,7 +929,7 @@ if __name__ == "__main__":
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--schedule", type=str, default="Linear")
     parser.add_argument("--batch_size", type=int, default=128)
-    parser.add_argument("--preference_iterations", type=int, default=1000000)
+    parser.add_argument("--preference_iterations", type=int, default=500000)
     parser.add_argument("--flow_train_iterations", type=int, default=10000)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--q_lr", type=float, default=3e-4)
@@ -924,6 +966,10 @@ if __name__ == "__main__":
     parser.add_argument("--auto_tune_alpha", action="store_true", default=True, help="Auto-tune alpha")
     parser.add_argument("--alpha_lr", type=float, default=3e-4, help="Learning rate for alpha")
     parser.add_argument("--diffusion_steps", type=int, default=1, help="ODE steps for flow sampling")
+    
+    # Previous action conditioning
+    parser.add_argument("--use_prev_action", action="store_true", default=False,
+                        help="If True, condition policy on [obs, prev_action] instead of just obs")
     
     args = parser.parse_args()
     main(args)

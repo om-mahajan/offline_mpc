@@ -220,7 +220,7 @@ def ipl_preference_loss(q_critic, v_target, batch_seg, gamma, chi2_coeff, target
     with torch.no_grad():
         v_next = v_target(next_obs_all).unsqueeze(0)
         if target_clip:
-            q_lim = 1.0 / (chi2_coeff * (gamma + 1e-6))
+            q_lim = 10.0 / (chi2_coeff * (gamma + 1e-6))
             v_next = v_next.clamp(-q_lim, q_lim)
 
     reward = qs - gamma * v_next
