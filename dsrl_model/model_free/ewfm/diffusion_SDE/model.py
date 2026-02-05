@@ -258,8 +258,6 @@ class ScoreBase(nn.Module):
 
     def sample_and_logprob(self, states, diffusion_steps=15, hutchinson_samples=1, prev_actions=None):
         """
-        Sample actions and compute log-probability for SAC-style entropy.
-        Uses OT flow matching with Hutchinson trace estimator for divergence.
         
         Args:
             states: [B, obs_dim] conditioning states
