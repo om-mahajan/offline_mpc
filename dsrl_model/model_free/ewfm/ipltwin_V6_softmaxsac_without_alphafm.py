@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """
-IPL-Style Flow Matching: Single-Step Policy with Inverse Bellman Operator
-Fixed segment-based preference loss with proper tensor shapes
-+ Added Q/V/Advantage visualization after Phase 1
+
 """
 
 import os
@@ -88,7 +86,7 @@ default_cfg = {
 # ============== JIT-compiled OT functions ==============
 @torch.jit.script
 def psi_t_ot_jit(x0: torch.Tensor, x1: torch.Tensor, t: torch.Tensor, sigma_min: float) -> torch.Tensor:
-    """OT linear interpolation - JIT compiled"""
+
     one_minus_sigma_min = 1.0 - sigma_min
     t_view = t.view(-1, 1)
     sigma_t = 1.0 - one_minus_sigma_min * t_view
@@ -97,7 +95,7 @@ def psi_t_ot_jit(x0: torch.Tensor, x1: torch.Tensor, t: torch.Tensor, sigma_min:
 
 @torch.jit.script
 def u_t_ot_jit(x_t: torch.Tensor, x1: torch.Tensor, t: torch.Tensor, sigma_min: float) -> torch.Tensor:
-    """OT vector field - JIT compiled"""
+
     one_minus_sigma_min = 1.0 - sigma_min
     denom = (1.0 - one_minus_sigma_min * t).view(-1, 1).clamp(min=1e-6)
     return (x1 - one_minus_sigma_min * x_t) / denom
@@ -106,7 +104,7 @@ def u_t_ot_jit(x_t: torch.Tensor, x1: torch.Tensor, t: torch.Tensor, sigma_min: 
 @torch.jit.script
 def compute_segment_weights_jit(energy_flat: torch.Tensor, gamma_powers: torch.Tensor, 
                                 B: int, H: int, alpha: float) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute segment-level softmax weights - JIT compiled"""
+    """"""
     energy_seg = energy_flat.view(B, H)
     A_seg = (energy_seg * gamma_powers).sum(dim=1)
     w_seg = F.softmax((alpha * A_seg).clamp(-20.0, 20.0), dim=0)
@@ -115,7 +113,7 @@ def compute_segment_weights_jit(energy_flat: torch.Tensor, gamma_powers: torch.T
 
 @torch.jit.script
 def compute_weighted_loss_jit(v_theta: torch.Tensor, u_t: torch.Tensor, w_seg: torch.Tensor, B: int, H: int) -> torch.Tensor:
-    """Compute weighted segment loss - JIT compiled"""
+
     err = ((v_theta - u_t) ** 2).sum(dim=1)  # [B*H]
     err_seg = err.view(B, H)
     return (w_seg.unsqueeze(1) * err_seg).sum() / H
@@ -150,7 +148,7 @@ def normalize_observation(mu_obs, std_obs, obs):
 
 
 class IPL_TwinQ_Critic(nn.Module):
-    """IPL Critic using TwinQ from model.py for robust Q-value estimation"""
+    """IPL Critic using TwinQ from model.py"""
     def __init__(self, obs_dim, act_dim, args):
         super().__init__()
         self.q_network = TwinQ(action_dim=act_dim, state_dim=obs_dim)
@@ -174,7 +172,7 @@ class IPL_TwinQ_Critic(nn.Module):
 
 
 class VNetwork(nn.Module):
-    """Value network - optimized with inplace ReLU"""
+    """Value network """
     def __init__(self, obs_dim, hidden_size=256):
         super().__init__()
         self.net = nn.Sequential(
@@ -192,9 +190,7 @@ class VNetwork(nn.Module):
 
 
 def sample_segment_batch_fast(neg_obs, neg_act, union_obs, union_act, buffers, return_prev_actions=False):
-    """Optimized segment sampling with pre-computed offsets
-    
-    Args:
+    """
         return_prev_actions: If True, include 'prev_a' in returned dicts
     """
     B = buffers.batch_size
@@ -252,11 +248,8 @@ def sample_transitions_fast(union_obs, union_act, batch_size, device):
 
 
 def sample_flow_segments_fast(union_obs, union_act, buffers, horizon=None, return_prev_actions=False):
-    """Optimized flow segment sampling with pre-computed offsets
-    
-    Args:
+    """
         return_prev_actions: If True, also return prev_actions [B, H, act_dim] where
-                             prev_a[:, 0, :] = 0 and prev_a[:, 1:, :] = act[:, :-1, :]
     """
     B = buffers.batch_size
     H = horizon if horizon is not None else buffers.horizon
@@ -290,8 +283,7 @@ def sample_flow_segments_fast(union_obs, union_act, buffers, horizon=None, retur
 def ipl_preference_loss(q_critic, flow_model, batch_seg, gamma, chi2_coeff, target_clip, act_dim, 
                         alpha=0.1, diffusion_steps=10, use_prev_action=False):
     """
-    Soft IPL preference loss with entropy-regularized inverse Bellman operator.
-    Uses soft Q-target: Q(s',a') - α * log π(a'|s')
+    soft Q-target: Q(s',a') - α * log π(a'|s')
     """
     seg_u, seg_n = batch_seg["union"], batch_seg["neg"]
     s_neg, a_neg, s_neg_next = seg_n["s"], seg_n["a"], seg_n["s_next"]
@@ -347,7 +339,7 @@ def ipl_preference_loss(q_critic, flow_model, batch_seg, gamma, chi2_coeff, targ
     return pref_loss + chi2_loss, r_uni.mean(), r_neg.mean(), logp_next.mean()
 
 def v_expectile_loss(q_target, v_model, batch_seg, tau):
-    """IQL-style expectile regression for V(s)"""
+    """expectile regression for V(s)"""
     seg_u, seg_n = batch_seg["union"], batch_seg["neg"]
     s_all = torch.cat([seg_u["s"].reshape(-1, seg_u["s"].shape[-1]),
                        seg_n["s"].reshape(-1, seg_n["s"].shape[-1])], dim=0)
@@ -465,7 +457,7 @@ def plot_q_energy_grid(q_critic, neg_data, union_data, device, save_path, energy
     plt.savefig(save_path, dpi=250)
     plt.close()
 
-    print(f"🖼️ Saved Q/E grid → {save_path}")
+    print(f"Saved Q/E grid → {save_path}")
 
 
 
@@ -510,7 +502,7 @@ def train_flow_matching_step(flow_model, flow_optimizer, q_critic,
         weights = F.softmax(alpha * energy, dim=0).detach()
         
         if torch.isnan(weights).any() or torch.isinf(weights).any():
-            print("⚠️ WARNING: NaN/Inf in weights, using uniform")
+            print("nan weights, using uniform")
             weights = torch.ones(batch, device=device) / batch
     else:
         weights = torch.ones(batch, device=device) / batch
@@ -518,7 +510,7 @@ def train_flow_matching_step(flow_model, flow_optimizer, q_critic,
     loss = torch.sum(err * weights)
     
     if torch.isnan(loss) or torch.isinf(loss):
-        print("⚠️ WARNING: Invalid loss, skipping")
+        print("nan loss, skipping")
         flow_model.condition = None
         return 0.0
     
@@ -535,12 +527,7 @@ def train_flow_step_segment(flow_model, flow_optimizer, scaler, q_critic,
                             seg_s, seg_a, gamma_powers, buffers, config, use_guidance=True,
                             alpha=0.1, in_warmup=False, seg_prev_a=None):
     """
-    Flow policy training with optional SAC entropy bonus.
-    During warmup: Pure FM loss (fast, stable)
-    After warmup: SAC policy loss + FM regularization
-    
-    Args:
-        seg_prev_a: [B, H, act_dim] previous actions (optional, for prev_action conditioning)
+    segment based
     """
     flow_model.train()
     B, H, obs_dim = seg_s.shape
@@ -657,8 +644,8 @@ def main(args):
     logger = EpochLogger(log_dir=args.log_dir, seed=str(args.seed))
     logger.save_config({**config, **vars(args)})
     tb_writer = SummaryWriter(log_dir=os.path.join(args.log_dir, 'tensorboard'))
-    print(f"📊 TensorBoard logs: {tb_writer.log_dir}")
-    print(f"   Run: tensorboard --logdir={args.log_dir}")
+    print(f"TensorBoard logs: {tb_writer.log_dir}")
+    print(f"Run: tensorboard --logdir={args.log_dir}")
     
      
     # Environment & Dataset
@@ -690,12 +677,12 @@ def main(args):
     norm_fn = functools.partial(normalize_observation, mu_obs, std_obs)
     
     # Preload to GPU
-    print("\nPre-loading data to GPU...")
+    print("\ndata to GPU...")
     neg_obs = torch.as_tensor(neg_data['observations'], dtype=torch.float32, device=device)
     neg_act = torch.as_tensor(neg_data['actions'], dtype=torch.float32, device=device)
     union_obs = torch.as_tensor(union_data['observations'], dtype=torch.float32, device=device)
     union_act = torch.as_tensor(union_data['actions'], dtype=torch.float32, device=device)
-    print(f"📦 GPU: {torch.cuda.memory_allocated(device) / 1e9:.2f} GB | neg={neg_obs.shape}, union={union_obs.shape}")
+    print(f"GPU: {torch.cuda.memory_allocated(device) / 1e9:.2f} GB | neg={neg_obs.shape}, union={union_obs.shape}")
     
     # Models
     obs_dim = eval_env.observation_space.shape[0]
@@ -703,6 +690,19 @@ def main(args):
     
     print("\nInitializing models...")
     q_critic = IPL_TwinQ_Critic(obs_dim=obs_dim, act_dim=act_dim, args=args).to(device)
+
+    # Load pretrained Q model and freeze if specified
+    if args.use_pretrained_q:
+        assert args.pretrained_q_path is not None, "Must provide --pretrained_q_path when using --use_pretrained_q"
+        ckpt = torch.load(args.pretrained_q_path, map_location=device, weights_only=True)
+        q_critic.load_state_dict(ckpt)
+        print(f"Q load dir: {args.pretrained_q_path}")
+        for p in q_critic.parameters():
+            p.requires_grad = False
+        q_critic.eval()
+        q_frozen = True
+    else:
+        q_frozen = False
 
     use_prev_action = config.get('use_prev_action', False)
     flow_model = ScoreNet(
@@ -715,7 +715,7 @@ def main(args):
     
     # Fused optimizers for faster CUDA ops
     use_fused = device.type == 'cuda'
-    q_opt = Adam(q_critic.parameters(), lr=config['q_lr'], weight_decay=config['weight_decay'], fused=use_fused)
+    q_opt = None if q_frozen else Adam(q_critic.parameters(), lr=config['q_lr'], weight_decay=config['weight_decay'], fused=use_fused)
     flow_opt = Adam(flow_model.parameters(), lr=config['lr'], weight_decay=config['weight_decay'], fused=use_fused)
     
     # ========== SAC Alpha (Temperature) Infrastructure ==========
@@ -752,8 +752,8 @@ def main(args):
     # Precompute gamma powers for segment advantage: [H]
     gamma_powers = (config['gamma'] ** torch.arange(flow_horizon, device=device, dtype=torch.float32))
     
-    logger.log(f"📋 Config: warmup={warmup_iters}, horizon={flow_horizon}, weight_from_q={config['weight_from_q']}")
-    logger.log(f"📋 Pre-allocated buffers: size={max_buf_size}")
+    logger.log(f"Config: warmup={warmup_iters}, horizon={flow_horizon}, weight_from_q={config['weight_from_q']}")
+    logger.log(f"Pre-allocated buffers: size={max_buf_size}")
     
     pbar = tqdm(range(total_iters), desc="JointTraining", unit="iter")
     start_time = time.time()
@@ -774,12 +774,12 @@ def main(args):
         in_warmup = step < warmup_iters
         
         # ========== Sample Data ==========
-        # Segment batch for IPL (only after warmup)
-        if not in_warmup:
+        # Segment batch for IPL (only after warmup and if Q trainable)
+        if not in_warmup and q_opt is not None:
             batch_seg = sample_segment_batch_fast(neg_obs, neg_act, union_obs, union_act, buffers,
                                                    return_prev_actions=use_prev_action)
         
-        # Flow segments from union data (use pre-allocated offsets)
+        # Flow segments from union data 
         if use_prev_action:
             seg_s, seg_a, seg_prev_a = sample_flow_segments_fast(union_obs, union_act, buffers, flow_horizon,
                                                                   return_prev_actions=True)
@@ -787,8 +787,8 @@ def main(args):
             seg_s, seg_a = sample_flow_segments_fast(union_obs, union_act, buffers, flow_horizon)
             seg_prev_a = None
         
-        # ========== Q-Learning Step (skip during warmup) ==========
-        if not in_warmup:
+        # ========== Q-Learning Step (skip during warmup or if Q frozen) ==========
+        if not in_warmup and q_opt is not None:
             # Get current alpha value
             alpha = config['alpha']
             
@@ -828,8 +828,8 @@ def main(args):
         
 
         
-        # ========== Target Update (after warmup) ==========
-        if (not in_warmup) and ((step + 1) % config['target_update_freq'] == 0):
+        # ========== Target Update (after warmup, skip if Q frozen) ==========
+        if q_opt is not None and (not in_warmup) and ((step + 1) % config['target_update_freq'] == 0):
             update_target(q_critic.q_network, q_critic.q_target, config['target_tau'])
             
         # ========== Logging (sync here only) ==========
@@ -894,7 +894,7 @@ def main(args):
     logger.torch_save(itr=total_iters, torch_saver_elements=flow_model, prefix="flow_final")
     logger.torch_save(itr=total_iters, torch_saver_elements=q_critic, prefix="q_critic_final")
     
-    logger.log("✅ Joint training complete!")
+    logger.log("training complete!")
     
     # ========== Visualization ==========
     plot_save_path = os.path.join(args.log_dir, "q_function_analysis.png")
@@ -912,7 +912,7 @@ def main(args):
     
     logger.log("\n" + "="*60)
     logger.log("Training complete!")
-    logger.log(f"📊 TensorBoard logs: {tb_writer.log_dir}")
+    logger.log(f"TensorBoard logs: {tb_writer.log_dir}")
     logger.log("="*60)
 
 
@@ -929,7 +929,7 @@ if __name__ == "__main__":
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--schedule", type=str, default="Linear")
     parser.add_argument("--batch_size", type=int, default=128)
-    parser.add_argument("--preference_iterations", type=int, default=500000)
+    parser.add_argument("--preference_iterations", type=int, default=1000000)
     parser.add_argument("--flow_train_iterations", type=int, default=10000)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--q_lr", type=float, default=3e-4)
@@ -970,6 +970,15 @@ if __name__ == "__main__":
     # Previous action conditioning
     parser.add_argument("--use_prev_action", action="store_true", default=False,
                         help="If True, condition policy on [obs, prev_action] instead of just obs")
+    
+    # Pretrained Q model loading
+    parser.add_argument("--use_pretrained_q", action="store_true", default=False,
+                        help="Load pretrained Q model and freeze it, train only flow")
+    parser.add_argument("--pretrained_q_path", type=str, default=None,
+                        help="Path to pretrained Q model checkpoint (.pt file)")
+    parser.add_argument{"--train_horizon", type=int, default=10,
+                        help="Horizon for future prediction"}
+                    TODO: add horion
     
     args = parser.parse_args()
     main(args)

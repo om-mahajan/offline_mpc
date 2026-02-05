@@ -339,9 +339,6 @@ class ScoreBase(nn.Module):
     def sample_and_logprob_fast(self, states, diffusion_steps=10, prev_actions=None):
         """
         Fast approximate sampling with log-prob.
-        Uses simple approximation: logp ≈ -0.5 * ||x0||^2 (ignores Jacobian)
-        Much faster - use for training, full version for evaluation.
-        
         Args:
             states: [B, obs_dim] conditioning states
             diffusion_steps: number of Euler steps
@@ -397,9 +394,6 @@ class ScoreBase(nn.Module):
 
     def sample_actions_fast(self, states, diffusion_steps=15, prev_actions=None):
         """
-        Fast action sampling without log-prob computation.
-        Uses Euler integration for speed.
-        
         Args:
             states: [B, obs_dim] conditioning states
             diffusion_steps: number of Euler steps
@@ -507,7 +501,7 @@ class ScoreBase(nn.Module):
 
 
 class ScoreNet(ScoreBase):
-    def __init__(self, input_dim, output_dim, marginal_prob_std, embed_dim=128, cond_dim=32, use_prev_action=False, **kwargs):
+    def __init__(self, input_dim, output_dim, marginal_prob_std, embed_dim=512, cond_dim=32, use_prev_action=False, **kwargs):
         super().__init__(input_dim, output_dim, marginal_prob_std, embed_dim, **kwargs)
         
         # Store dimensions

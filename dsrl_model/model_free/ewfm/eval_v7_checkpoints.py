@@ -84,7 +84,7 @@ def evaluate_checkpoint(ckpt_path, env, device, num_episodes, obs_dim, act_dim, 
     """Evaluate single checkpoint."""
     # Get embed_dim and cond_dim from args (loaded from config)
     
-    embed_dim = getattr(args, 'embed_dim', 128)
+    embed_dim = getattr(args, 'embed_dim', 512)
     cond_dim = getattr(args, 'cond_dim', 32)
     
     flow_model = ScoreNet(
