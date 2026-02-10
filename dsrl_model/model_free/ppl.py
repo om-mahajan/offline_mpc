@@ -5,16 +5,13 @@ import re
 import sys
 import time
 from collections import deque
-from copy import deepcopy
 
 import dsrl.infos as dsrl_infos
 import dsrl.offline_safety_gymnasium  # type: ignore
 import gymnasium as gym
 import numpy as np
 import torch
-import torch.distributions as td
 import torch.nn.functional as F
-from torch.autograd import Variable
 from torch.nn.utils.clip_grad import clip_grad_norm_
 from torch.optim.lr_scheduler import LinearLR
 
@@ -22,15 +19,11 @@ from dsrl_model.utils.bufffer import OnPolicyBuffer
 from dsrl_model.utils.dsrl_dataset import (
     get_dataset_in_d4rl_format,
     get_neg_and_union_data_2,
-    get_normalized_data,
 )
 from dsrl_model.utils.logger import EpochLogger
 from dsrl_model.utils.models import (
     BcqVAE,
-    Encoder,
-    ExpCostModel,
     SafeDiceTanhMixtureActor,
-    horizon_gradient_panelty,
 )
 from dsrl_model.utils.save_video_with_value import save_video
 from dsrl_model.utils.utils import ActionRepeater, get_params_norm, single_agent_args
@@ -57,48 +50,37 @@ trajectory_cfg = {
     "density": 1.0,
     "target_cost": 25.0,
     # ((low_cost, low_reward), (high_cost, low_reward), (medium_cost, high_reward))
-    "inpaint_ranges": ((0.0, 1.0, 0.0, 0.5),),
-    "num_negative_trajectories": 50,
+    "inpaint_ranges": None,
+    "num_pure_negative_trajectories": 50,
+    "num_union_negative_trajectories": 150,
     "num_union_trajectories": -1,
     "percentage_validation_trajectories": 0.2,
 }
 
 
 @torch.no_grad
-def evaluate_bc_policy(eval_env, bc_policy, reward_model, device):
+def evaluate_bc_policy(eval_env, bc_policy, device):
     eval_done = False
     eval_obs, _ = eval_env.reset()
-    # eval_obs = (eval_obs - mu_obs) / (std_obs + EP)
     eval_obs = torch.as_tensor(eval_obs, dtype=torch.float32, device=device).unsqueeze(
         0
     )
-    eval_reward, eval_cost, eval_pred_reward, eval_len = (
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-    )
+    eval_reward, eval_cost, eval_len = 0.0, 0.0, 0.0
     while not eval_done:
         act = bc_policy(eval_obs)
         next_obs, reward, terminated, truncated, info = eval_env.step(
             act[0].detach().squeeze().cpu().numpy()
         )
         cost = info["cost"]
-        # next_obs = (next_obs - mu_obs) / (std_obs + EP)
         next_obs = torch.as_tensor(
             next_obs, dtype=torch.float32, device=device
         ).unsqueeze(0)
-        with torch.no_grad():
-            pred_reward = reward_model(
-                torch.cat([eval_obs, act], dim=1), use_sigmoid=True
-            ).item()
         eval_obs = next_obs
         eval_reward += reward
         eval_cost += cost
-        eval_pred_reward += pred_reward
         eval_len += 1
         eval_done = terminated or truncated
-    return eval_reward, eval_cost, eval_pred_reward, eval_len
+    return eval_reward, eval_cost, eval_len
 
 
 def ema(m, m_target, tau):
@@ -121,7 +103,6 @@ def discounted_sum(vector_x, gamma):
 
 def bc_policy_loss_fn(
     bc_policy,
-    reward_model,
     target_obs,
     target_act,
     config,
@@ -132,11 +113,6 @@ def bc_policy_loss_fn(
 
     target_obs = target_obs.view(horizon * batch_size, -1)
     target_act = target_act.view(horizon * batch_size, -1)
-
-    with torch.no_grad():
-        weight = 1 - reward_model(
-            torch.cat([target_obs, target_act], dim=1), use_sigmoid=True
-        )
 
     if config["policy_type"] == "vae":
         pred_act, bc_mean, bc_std = bc_policy(target_obs, target_act)
@@ -150,49 +126,7 @@ def bc_policy_loss_fn(
         recon_loss = F.mse_loss(pred_act, target_act, reduction="none").sum(dim=1)
         loss = recon_loss
 
-    loss = weight * loss
     return torch.mean(loss)
-
-
-def reward_loss_fn(
-    reward_model,
-    target_neg_obs,
-    target_neg_act,
-    target_union_obs,
-    target_union_act,
-    config,
-):
-    gamma = config["gamma"]
-    discount, total_neg_cost, total_union_cost, total_mix_cost = 1.0, 0.0, 0.0, 0.0
-    device = target_neg_obs.device
-
-    # Horizon X Batch X obs/act_dim
-    horizon, batch_size, _ = target_neg_obs.shape
-
-    target_neg = torch.cat([target_neg_obs, target_neg_act], dim=-1)
-    target_union = torch.cat([target_union_obs, target_union_act], dim=-1)
-
-    unif_rand = torch.rand(size=(horizon, batch_size, 1)).to(device)
-    target_mixed = unif_rand * target_neg + (1 - unif_rand) * target_union
-    target_mixed_input = Variable(target_mixed, requires_grad=True).to(device=device)
-
-    for t in range(horizon):
-        tn, tu, tm = target_neg[t], target_union[t], target_mixed_input[t]
-        total_neg_cost += discount * reward_model(tn, use_sigmoid=True)
-        total_union_cost += discount * reward_model(tu, use_sigmoid=True)
-        total_mix_cost += discount * reward_model(tm, use_sigmoid=True)
-        discount *= gamma
-
-    exp_neg, exp_union = torch.exp(total_neg_cost), torch.exp(total_union_cost)
-    sum_exp = exp_neg + exp_union
-    p_neg, p_union = exp_neg / sum_exp, exp_union / sum_exp
-    target_ones = torch.ones_like(p_neg, device=device)
-    target_zeros = torch.zeros_like(p_union, device=device)
-    loss = F.binary_cross_entropy(p_union, target_zeros)
-    loss += F.binary_cross_entropy(p_neg, target_ones)
-
-    grad_loss = 0.0  # horizon_gradient_panelty(target_mixed_input, total_mix_cost)
-    return torch.mean(loss) + config["grad_reg_coeffs"] * grad_loss
 
 
 def main(args, cfg_env=None):
@@ -262,15 +196,6 @@ def main(args, cfg_env=None):
     #     weight_decay=config["weight_decay"],
     #     warmup_steps=1000,
     # )
-    reward_model = ExpCostModel(
-        obs_dim=obs_space.shape[0] + act_space.shape[0],
-        hidden_sizes=config["hidden_sizes"],
-    ).to(device)
-    reward_model_optimizer = torch.optim.AdamW(
-        reward_model.parameters(),
-        lr=args.lr,
-        weight_decay=config["weight_decay"],
-    )
 
     # data
     agent_task = re.search(r"Offline(.*?)Gymnasium-v[0-9]", args.task).group(1)
@@ -320,7 +245,6 @@ def main(args, cfg_env=None):
     eval_cost_deque = deque(maxlen=config["eval_episode_freq"])
     eval_norm_rew_deque = deque(maxlen=config["eval_episode_freq"])
     eval_norm_cost_deque = deque(maxlen=config["eval_episode_freq"])
-    eval_pred_reward_deque = deque(maxlen=config["eval_episode_freq"])
     eval_len_deque = deque(maxlen=config["eval_episode_freq"])
     dict_args = config
     dict_args.update((k, v) for k, v in vars(args).items() if v is not None)
@@ -329,38 +253,21 @@ def main(args, cfg_env=None):
         seed=str(args.seed),
     )
     logger.save_config(dict_args)
-    logger.log("Start with bc_policy, cost model training.")
+    logger.log("Start with bc_policy training.")
 
     steps = 0
     while steps < config["total_iteration"]:
         # shape: Horizon X Batch X obs/act_dim
         for (
-            target_neg_obs,
-            target_neg_act,
+            _target_neg_obs,
+            _target_neg_act,
             target_union_obs,
             target_union_act,
             _,
         ) in buffer.sample():
 
-            reward_loss = reward_loss_fn(
-                reward_model=reward_model,
-                target_neg_obs=target_neg_obs,
-                target_neg_act=target_neg_act,
-                target_union_obs=target_union_obs,
-                target_union_act=target_union_act,
-                config=config,
-            )
-            reward_loss.register_hook(lambda grad: grad * (1 / config["train_horizon"]))
-            reward_model_optimizer.zero_grad()
-            reward_loss.backward()
-            clip_grad_norm_(reward_model.parameters(), config["max_grad_norm"])
-            reward_model_optimizer.step()
-
-            # bc_policy.train()
-            # bc_policy_optimizer.train()
             bc_policy_loss = bc_policy_loss_fn(
                 bc_policy=bc_policy,
-                reward_model=reward_model,
                 target_obs=target_union_obs,
                 target_act=target_union_act,
                 config=config,
@@ -385,7 +292,6 @@ def main(args, cfg_env=None):
                         (
                             eval_reward,
                             eval_cost,
-                            eval_pred_reward,
                             eval_len,
                         ) = evaluate_bc_policy(
                             eval_env=eval_env,
@@ -394,7 +300,6 @@ def main(args, cfg_env=None):
                                 if config["policy_type"] == "vae"
                                 else bc_policy.action
                             ),
-                            reward_model=reward_model,
                             device=device,
                         )
                         norm_reward, norm_cost = eval_env.get_normalized_score(
@@ -404,13 +309,11 @@ def main(args, cfg_env=None):
                         eval_norm_cost_deque.append(norm_cost)
                         eval_rew_deque.append(eval_reward)
                         eval_cost_deque.append(eval_cost)
-                        eval_pred_reward_deque.append(eval_pred_reward)
                         eval_len_deque.append(eval_len)
                     logger.store(
                         **{
                             "Metrics/EvalEpRet": np.mean(eval_rew_deque),
                             "Metrics/EvalEpCost": np.mean(eval_cost_deque),
-                            "Metrics/EvalEpPredReward": np.mean(eval_pred_reward_deque),
                             "Metrics/EvalEpNormRet": np.mean(eval_norm_rew_deque),
                             "Metrics/EvalEpNormCost": np.mean(eval_norm_cost_deque),
                             "Metrics/EvalEpLen": np.mean(eval_len_deque),
@@ -420,21 +323,15 @@ def main(args, cfg_env=None):
 
                     logger.log_tabular("Metrics/EvalEpRet")
                     logger.log_tabular("Metrics/EvalEpCost")
-                    logger.log_tabular("Metrics/EvalEpPredReward")
                     logger.log_tabular("Metrics/EvalEpNormRet")
                     logger.log_tabular("Metrics/EvalEpNormCost")
                     logger.log_tabular("Metrics/EvalEpLen")
 
                 logger.log_tabular("Train/Steps", steps)
                 logger.log_tabular("Loss/Loss_bc_policy", bc_policy_loss.mean().item())
-                logger.log_tabular("Loss/Loss_reward", reward_loss.mean().item())
                 logger.log_tabular(
                     "Norm/bc_policy",
                     get_params_norm(bc_policy.parameters(), grads=False),
-                )
-                logger.log_tabular(
-                    "Norm/reward_model",
-                    get_params_norm(reward_model.parameters(), grads=False),
                 )
                 if args.use_eval:
                     logger.log_tabular("Time/Eval", eval_end_time - eval_start_time)
@@ -446,17 +343,11 @@ def main(args, cfg_env=None):
                     torch_saver_elements=bc_policy,
                     prefix="bc_policy",
                 )
-                logger.torch_save(
-                    itr=steps,
-                    torch_saver_elements=reward_model,
-                    prefix="reward",
-                )
 
             if steps >= config["total_iteration"]:
                 break
 
     logger.torch_save(itr=steps, torch_saver_elements=bc_policy, prefix="bc_policy")
-    logger.torch_save(itr=steps, torch_saver_elements=reward_model, prefix="reward")
     logger.close()
 
 

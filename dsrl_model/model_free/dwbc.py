@@ -6,7 +6,7 @@ import sys
 import time
 from collections import deque
 from copy import deepcopy
-
+from pathlib import Path
 import dsrl.infos as dsrl_infos
 import dsrl.offline_safety_gymnasium  # type: ignore
 import gymnasium as gym
@@ -17,6 +17,12 @@ import torch.nn.functional as F
 from torch.autograd import Variable
 from torch.nn.utils.clip_grad import clip_grad_norm_
 from torch.optim.lr_scheduler import LinearLR
+from torch.utils.tensorboard import SummaryWriter
+
+current_file = Path(__file__).resolve()
+offline_mpc_dir = current_file.parents[2]  # Go up 2 levels to reach offline_mpc
+sys.path.insert(0, str(offline_mpc_dir))
+
 
 from dsrl_model.utils.bufffer import SafeDiceBuffer
 from dsrl_model.utils.dsrl_dataset import (
@@ -59,8 +65,9 @@ trajectory_cfg = {
     "density": 1.0,
     "target_cost": 25.0,
     # ((low_cost, low_reward), (high_cost, low_reward), (medium_cost, high_reward))
-    "inpaint_ranges": ((0.0, 1.0, 0.0, 0.5),),
-    "num_negative_trajectories": 50,
+    "inpaint_ranges": None,
+    "num_pure_negative_trajectories": 50,
+    "num_union_negative_trajectories": 150,
     "num_union_trajectories": -1,
     "percentage_validation_trajectories": 0.2,
 }
@@ -272,6 +279,7 @@ def main(args, cfg_env=None):
         seed=str(args.seed),
     )
     logger.save_config(dict_args)
+    tb_writer = SummaryWriter(log_dir=os.path.join(args.log_dir, 'tensorboard'))
 
     # train critic and actor model
     eval_rew_deque = deque(maxlen=config["eval_episode_freq"])
@@ -282,6 +290,11 @@ def main(args, cfg_env=None):
 
     logger.log("Start with critic and actor model training.")
     steps = 0
+    # Loss accumulators to avoid GPU sync every step
+    acc_cost_loss = 0.0
+    acc_pi_loss = 0.0
+    acc_count = 0
+    
     while steps < config["total_iteration"]:
         # for epoch in range(num_epochs):
 
@@ -322,11 +335,17 @@ def main(args, cfg_env=None):
             actor_optimizer.step()
             actor_scheduler.step()
 
+            # Accumulate losses on GPU (no sync)
+            acc_cost_loss += cost_loss.detach()
+            acc_pi_loss += pi_loss.detach()
+            acc_count += 1
+
             logger.logged = False
 
             steps += 1
 
             if (steps % config["log_freq"] == 0) and (not logger.logged):
+                
                 # evaluate episodes
                 eval_episodes = config["eval_episode_freq"]
                 if args.use_eval:
@@ -356,33 +375,16 @@ def main(args, cfg_env=None):
                     )
                     eval_end_time = time.time()
 
-                    logger.log_tabular("Metrics/EvalEpRet")
-                    logger.log_tabular("Metrics/EvalEpCost")
-                    logger.log_tabular("Metrics/EvalEpNormRet")
-                    logger.log_tabular("Metrics/EvalEpNormCost")
-                    logger.log_tabular("Metrics/EvalEpLen")
-                    logger.log_tabular("Time/Eval", eval_end_time - eval_start_time)
-
-                logger.log_tabular("Train/Steps", steps)
-                logger.log_tabular("Loss/Loss_bc_policy", pi_loss.mean().item())
-                logger.log_tabular("Loss/Loss_critic", cost_loss.mean().item())
-                logger.log_tabular(
-                    "Norm/Params/bc_policy",
-                    get_params_norm(actor.parameters(), grads=False),
-                )
-                logger.log_tabular(
-                    "Norm/Params/critic_model",
-                    get_params_norm(critic_model.parameters(), grads=False),
-                )
-                logger.log_tabular(
-                    "Norm/Grad/bc_policy",
-                    get_params_norm(actor.parameters(), grads=True),
-                )
-                logger.log_tabular(
-                    "Norm/Grad/critic_model",
-                    get_params_norm(critic_model.parameters(), grads=True),
-                )
-                logger.dump_tabular()
+                
+                # TensorBoard logging (sync only at log time)
+                cost_avg = (acc_cost_loss / acc_count).item()
+                pi_avg = (acc_pi_loss / acc_count).item()
+                tb_writer.add_scalar('Loss/bc_policy', pi_avg, steps)
+                tb_writer.add_scalar('Loss/cost_model', cost_avg, steps)
+                # Reset accumulators
+                acc_cost_loss = 0.0
+                acc_pi_loss = 0.0
+                acc_count = 0
 
             if steps % config["save_freq"] == 0:
                 logger.torch_save(
@@ -403,6 +405,7 @@ def main(args, cfg_env=None):
     logger.torch_save(
         itr=steps, torch_saver_elements=critic_model, prefix="critic_model"
     )
+    tb_writer.close()
     logger.close()
 
 
@@ -412,14 +415,15 @@ if __name__ == "__main__":
     subfolder = "-".join(["seed", str(args.seed).zfill(3)])
     relpath = "-".join([subfolder, relpath])
     algo = os.path.basename(__file__).split(".")[0]
-    args.log_dir = os.path.join(args.log_dir, args.experiment, args.task, algo, relpath)
+    base_log_dir = os.path.join(str(offline_mpc_dir), "logs")
+    args.log_dir = os.path.join(base_log_dir, args.experiment, args.task, algo, relpath)
     if not args.write_terminal:
         terminal_log_name = "terminal.log"
         error_log_name = "error.log"
         terminal_log_name = f"seed{args.seed}_{terminal_log_name}"
         error_log_name = f"seed{args.seed}_{error_log_name}"
         sys.stdout = sys.__stdout__
-        sys.stderr = sys.__stderr__
+        sys.stderr = sys.__stderr__ 
         if not os.path.exists(args.log_dir):
             os.makedirs(args.log_dir, exist_ok=True)
         with open(

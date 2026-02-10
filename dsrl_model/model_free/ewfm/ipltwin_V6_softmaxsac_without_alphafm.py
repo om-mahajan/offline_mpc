@@ -32,22 +32,22 @@ from diffusion_SDE.model import ScoreNet, TwinQ, update_target
 from dsrl_model.utils.logger import EpochLogger
 from dsrl_dataset import (
     get_dataset_in_d4rl_format,
-    get_neg_and_union_data_2,
-    get_normalized_data
+    get_normalized_data,
+    get_neg_and_positive_data
 )
 
 EP = 1e-6
 
 default_cfg = {
-    "log_freq": 1000,
+    "log_freq": 10000,
     "save_freq": 20000,
     "eval_episode_freq": 10,
     "max_grad_norm": 1.0,
-    "lr": 3e-4,
+    "lr": 1e-5,
     "weight_decay": 1e-5,
     "preference_iterations": 150000,
-    "q_lr": 3e-4,
-    "v_lr": 3e-4,
+    "q_lr": 1e-5,
+    "v_lr": 1e-5,
     "q_hidden": 256,
     "v_hidden": 256,
     "expectile_tau": 0.7,
@@ -67,8 +67,9 @@ default_cfg = {
     "horizon": 25,
     "weight_from_q": False,
     "density": 1.0,
-    "inpaint_ranges": ((0.0, 1.0, 0.0, 0.5),),
-    "num_negative_trajectories": 50,
+    "inpaint_ranges": None,
+    "num_pure_negative_trajectories": 50,
+    "num_union_negative_trajectories": 150,
     "num_union_trajectories": -1,
     "segment_length": 25,
     "sigma_min": 0.01,
@@ -324,7 +325,7 @@ def ipl_preference_loss(q_critic, flow_model, batch_seg, gamma, chi2_coeff, targ
         soft_q_next = q_next - alpha * logp_next
         
         if target_clip:
-            q_lim = 10.0 / (chi2_coeff * (gamma + 1e-6))
+            q_lim = 1.0 / (chi2_coeff * (gamma + 1e-6))
             soft_q_next = soft_q_next.clamp(-q_lim, q_lim)
 
     # Soft reward = Q(s,a) - γ * soft_Q(s',a')
@@ -450,8 +451,7 @@ def plot_q_energy_grid(q_critic, neg_data, union_data, device, save_path, energy
         cb = fig.colorbar(sc, ax=ax)
         cb.set_label(label)
 
-        for i in range(len(colors)):
-            ax.text(C[i], R[i], f"{i}", fontsize=6, alpha=0.5)
+    
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=250)
@@ -655,8 +655,9 @@ def main(args):
     
     dataset_config = {
         "density": config["density"],
-        "inpaint_ranges": config.get("inpaint_ranges", ((0.0, 1.0, 0.0, 0.5),)),
-        "num_negative_trajectories": config["num_negative_trajectories"],
+        "inpaint_ranges": config.get("inpaint_ranges", None),
+        "num_pure_negative_trajectories": config["num_pure_negative_trajectories"],
+        "num_union_negative_trajectories": config["num_union_negative_trajectories"],
         "num_union_trajectories": config["num_union_trajectories"],
         "non_pref_noise": 0.0,
     }
@@ -667,7 +668,7 @@ def main(args):
     max_traj_len = max(traj_lengths)
     
     d4rl_data = get_dataset_in_d4rl_format(eval_env, dataset_config, args.task, max_traj_len, num_folds=1)
-    neg_data, union_data = get_neg_and_union_data_2(d4rl_data, dataset_config)
+    neg_data, union_data = get_neg_and_positive_data(d4rl_data, dataset_config) #get_neg_and_union_data_2(d4rl_data, dataset_config)
     
     mu_obs, std_obs = None, None
     if args.normalize_observation:
@@ -931,9 +932,9 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--preference_iterations", type=int, default=1000000)
     parser.add_argument("--flow_train_iterations", type=int, default=10000)
-    parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--q_lr", type=float, default=3e-4)
-    parser.add_argument("--v_lr", type=float, default=3e-4)
+    parser.add_argument("--lr", type=float, default=1e-5)
+    parser.add_argument("--q_lr", type=float, default=1e-5)
+    parser.add_argument("--v_lr", type=float, default=1e-5)
     parser.add_argument("--lambda_reg", type=float, default=0.1)
     parser.add_argument("--expectile_tau", type=float, default=0.7)
     parser.add_argument("--gamma", type=float, default=0.99)
@@ -942,14 +943,12 @@ if __name__ == "__main__":
     parser.add_argument("--sigma_min", type=float, default=0.01)
     parser.add_argument("--target_update_freq", type=int, default=1)
     parser.add_argument("--target_tau", type=float, default=0.005)
-    parser.add_argument("--log_freq", type=int, default=1000)
+    parser.add_argument("--log_freq", type=int, default=10000)
     parser.add_argument("--save_freq", type=int, default=20000)
     parser.add_argument("--use_eval", action="store_true", default=False)
     parser.add_argument("--eval_freq", type=int, default=4000)
     parser.add_argument("--eval_episode_freq", type=int, default=25)
     parser.add_argument("--density", type=float, default=1.0)
-    parser.add_argument("--num_negative_trajectories", type=int, default=50)
-    parser.add_argument("--num_union_trajectories", type=int, default=-1)
     parser.add_argument("--q_hidden", type=int, default=256)
     parser.add_argument("--v_hidden", type=int, default=256)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
@@ -962,7 +961,7 @@ if __name__ == "__main__":
     
     # SAC entropy regularization
     parser.add_argument("--alpha", type=float, default=0.1, help="Initial SAC temperature")
-    parser.add_argument("--target_entropy", type=float, default=None, help="Target entropy (default: -act_dim)")
+    parser.add_argument("--target_entropy", type=float, default=None, help="Target entropy ")
     parser.add_argument("--auto_tune_alpha", action="store_true", default=True, help="Auto-tune alpha")
     parser.add_argument("--alpha_lr", type=float, default=3e-4, help="Learning rate for alpha")
     parser.add_argument("--diffusion_steps", type=int, default=1, help="ODE steps for flow sampling")
@@ -976,9 +975,7 @@ if __name__ == "__main__":
                         help="Load pretrained Q model and freeze it, train only flow")
     parser.add_argument("--pretrained_q_path", type=str, default=None,
                         help="Path to pretrained Q model checkpoint (.pt file)")
-    parser.add_argument{"--train_horizon", type=int, default=10,
-                        help="Horizon for future prediction"}
-                    TODO: add horion
+
     
     args = parser.parse_args()
     main(args)

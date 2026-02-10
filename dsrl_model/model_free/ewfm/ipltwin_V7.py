@@ -89,7 +89,7 @@ default_cfg = {
     # Dataset
     "density": 1.0,
     "inpaint_ranges": ((0.0, 1.0, 0.0, 0.5),),
-    "num_negative_trajectories": 50,
+    "num_negative_trajectories": 999999,  # Use all available negative trajectories
     "num_union_trajectories": -1,
     "device": "cuda",
 }
@@ -642,7 +642,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--weight_decay", type=float, default=1e-5)
     parser.add_argument("--density", type=float, default=1.0)
-    parser.add_argument("--num_negative_trajectories", type=int, default=50)
+    parser.add_argument("--num_negative_trajectories", type=int, default=999999)  # Use all available
     parser.add_argument("--num_union_trajectories", type=int, default=-1)
     parser.add_argument("--q_hidden", type=int, default=256)
     parser.add_argument("--v_hidden", type=int, default=256)

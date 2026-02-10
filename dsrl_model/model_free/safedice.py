@@ -18,6 +18,7 @@ import torch.nn.functional as F
 from torch.autograd import Variable
 from torch.nn.utils.clip_grad import clip_grad_norm_
 from torch.optim.lr_scheduler import LinearLR
+from torch.utils.tensorboard import SummaryWriter
 
 current_file = Path(__file__).resolve()
 offline_mpc_dir = current_file.parents[2]  # Go up 2 levels to reach offline_mpc
@@ -26,7 +27,7 @@ sys.path.insert(0, str(offline_mpc_dir))
 from dsrl_model.utils.bufffer import SafeDiceBuffer
 from dsrl_model.utils.dsrl_dataset import (
     get_dataset_in_d4rl_format,
-    get_neg_and_union_data_2,
+    get_neg_and_positive_data,
 )
 from dsrl_model.utils.logger import EpochLogger
 from dsrl_model.utils.models import (
@@ -60,15 +61,16 @@ default_cfg = {
     "weight_decay_cost": 0.01,
     "cost_weight_temp": 1.0,
     "act_train_use_logprob": True,
-    "use_eval": True,
+    "use_eval": False,
 }
 
 trajectory_cfg = {
     "density": 1.0,
     "target_cost": 25.0,
     # ((low_cost, low_reward), (high_cost, low_reward), (medium_cost, high_reward))
-    "inpaint_ranges": ((0.0, 1.0, 0.0, 0.5),),
-    "num_negative_trajectories": 50,
+    "inpaint_ranges": None, #this is for running full baselines(for weighted flow paper)
+    "num_pure_negative_trajectories": 50,
+    "num_union_negative_trajectories": 150,
     "num_union_trajectories": -1,
     "percentage_validation_trajectories": 0.2,
 }
@@ -263,7 +265,7 @@ def main(args, cfg_env=None):
     config["act_train_use_logprob"] = (
         args.act_train_use_logprob or config["act_train_use_logprob"]
     )
-    config["use_eval"] = args.use_eval or config.get("use_eval", True)
+    config["use_eval"] = args.use_eval or config.get("use_eval", False)
 
     # evaluation environment
     eval_env = gym.make(args.task)
@@ -328,7 +330,7 @@ def main(args, cfg_env=None):
     data = get_dataset_in_d4rl_format(
         eval_env, trajectory_cfg, args.task, ep_len, config["action_repeat"]
     )
-    neg_data, union_data = get_neg_and_union_data_2(data, trajectory_cfg)
+    neg_data, union_data = get_neg_and_positive_data(data, trajectory_cfg)
     # neg_data, union_data, mu_obs, std_obs = get_normalized_data(neg_data, union_data)
     neg_observations = torch.as_tensor(
         neg_data["observations"], dtype=torch.float32, device=device
@@ -372,10 +374,13 @@ def main(args, cfg_env=None):
         seed=str(args.seed),
     )
     logger.save_config(dict_args)
+    tb_writer = SummaryWriter(log_dir=os.path.join(args.log_dir, 'tensorboard'))
     logger.log("Start with cost model training.")
 
     # train cost model
     steps = 0
+    acc_cost_loss = 0.0
+    acc_cost_count = 0
     while steps < config["pretrain_iteration"]:
         # for ep in range(num_epochs):
         for (
@@ -400,13 +405,18 @@ def main(args, cfg_env=None):
             cost_loss.backward()
             cost_model_optimizer.step()
 
+            # Accumulate loss on GPU (no sync)
+            acc_cost_loss += cost_loss.detach()
+            acc_cost_count += 1
+
             steps += 1
 
             if steps % config["log_freq"] == 0:
-                # logger.log(f"Train cost time: {training_end_time - training_start_time}")
-                logger.log(
-                    f"Steps: {steps}, pretraining cost model loss: {cost_loss.item():.3f}"
-                )
+                cost_avg = (acc_cost_loss / acc_cost_count).item()
+                logger.log(f"Steps: {steps}, pretraining cost model loss: {cost_avg:.3f}")
+                tb_writer.add_scalar('Loss/cost_model', cost_avg, steps)
+                acc_cost_loss = 0.0
+                acc_cost_count = 0
 
             if steps >= config["pretrain_iteration"]:
                 break
@@ -428,6 +438,11 @@ def main(args, cfg_env=None):
 
     logger.log("Start with critic and actor model training.")
     steps = 0
+    # Loss accumulators to avoid GPU sync every step
+    acc_nu_loss = 0.0
+    acc_pi_loss = 0.0
+    acc_count = 0
+    
     while steps < config["total_iteration"]:
         # for epoch in range(num_epochs):
 
@@ -467,65 +482,82 @@ def main(args, cfg_env=None):
             actor_optimizer.step()
             actor_scheduler.step()
 
+            # Accumulate losses on GPU (no sync)
+            acc_nu_loss += nu_loss.detach()
+            acc_pi_loss += pi_loss.detach()
+            acc_count += 1
+
             logger.logged = False
 
             steps += 1
 
             if (steps % config["log_freq"] == 0) and (not logger.logged):
                 # evaluate episodes
-                eval_episodes = 1
-                eval_start_time = time.time()
-                for id in range(eval_episodes):
-                    eval_reward, eval_cost, eval_len, *_ = evaluate_bc_policy(
-                        eval_env=eval_env,
-                        bc_policy=actor,
-                        device=device,
+                if default_cfg["use_eval"]:
+                    eval_episodes = 1
+                    eval_start_time = time.time()
+                    for id in range(eval_episodes):
+                        eval_reward, eval_cost, eval_len, *_ = evaluate_bc_policy(
+                            eval_env=eval_env,
+                            bc_policy=actor,
+                            device=device,
+                        )
+                        norm_reward, norm_cost = eval_env.get_normalized_score(
+                            eval_reward, eval_cost
+                        )
+                        eval_norm_rew_deque.append(norm_reward)
+                        eval_norm_cost_deque.append(norm_cost)
+                        eval_rew_deque.append(eval_reward)
+                        eval_cost_deque.append(eval_cost)
+                        eval_len_deque.append(eval_len)
+                    eval_end_time = time.time()
+                    
+                    logger.log_tabular("Metrics/EvalEpRet", np.mean(eval_rew_deque))
+                    logger.log_tabular("Metrics/EvalEpCost", np.mean(eval_cost_deque))
+                    logger.log_tabular("Metrics/EvalEpNormRet", np.mean(eval_norm_rew_deque))
+                    logger.log_tabular("Metrics/EvalEpNormCost", np.mean(eval_norm_cost_deque))
+                    logger.log_tabular("Metrics/EvalEpLen", np.mean(eval_len_deque))
+                    logger.log_tabular("Time/Eval", eval_end_time - eval_start_time)
+                    logger.log_tabular("Metrics/Alpha", alpha)
+                    logger.log_tabular("Train/Steps", steps)
+                    logger.log_tabular("Loss/Loss_bc_policy", pi_loss.mean().item())
+                    logger.log_tabular("Loss/Loss_critic", nu_loss.mean().item())
+                    logger.log_tabular(
+                        "Norm/Params/bc_policy",
+                        get_params_norm(actor.parameters(), grads=False),
                     )
-                    norm_reward, norm_cost = eval_env.get_normalized_score(
-                        eval_reward, eval_cost
+                    logger.log_tabular(
+                        "Norm/Params/cost_model",
+                        get_params_norm(cost_model.parameters(), grads=False),
                     )
-                    eval_norm_rew_deque.append(norm_reward)
-                    eval_norm_cost_deque.append(norm_cost)
-                    eval_rew_deque.append(eval_reward)
-                    eval_cost_deque.append(eval_cost)
-                    eval_len_deque.append(eval_len)
-                eval_end_time = time.time()
-                
-                logger.log_tabular("Metrics/EvalEpRet", np.mean(eval_rew_deque))
-                logger.log_tabular("Metrics/EvalEpCost", np.mean(eval_cost_deque))
-                logger.log_tabular("Metrics/EvalEpNormRet", np.mean(eval_norm_rew_deque))
-                logger.log_tabular("Metrics/EvalEpNormCost", np.mean(eval_norm_cost_deque))
-                logger.log_tabular("Metrics/EvalEpLen", np.mean(eval_len_deque))
-                logger.log_tabular("Time/Eval", eval_end_time - eval_start_time)
-                logger.log_tabular("Metrics/Alpha", alpha)
-                logger.log_tabular("Train/Steps", steps)
-                logger.log_tabular("Loss/Loss_bc_policy", pi_loss.mean().item())
-                logger.log_tabular("Loss/Loss_critic", nu_loss.mean().item())
-                logger.log_tabular(
-                    "Norm/Params/bc_policy",
-                    get_params_norm(actor.parameters(), grads=False),
-                )
-                logger.log_tabular(
-                    "Norm/Params/cost_model",
-                    get_params_norm(cost_model.parameters(), grads=False),
-                )
-                logger.log_tabular(
-                    "Norm/Params/critic_model",
-                    get_params_norm(critic_model.parameters(), grads=False),
-                )
-                logger.log_tabular(
-                    "Norm/Grad/bc_policy",
-                    get_params_norm(actor.parameters(), grads=True),
-                )
-                logger.log_tabular(
-                    "Norm/Grad/cost_model",
-                    get_params_norm(cost_model.parameters(), grads=True),
-                )
-                logger.log_tabular(
-                    "Norm/Grad/critic_model",
-                    get_params_norm(critic_model.parameters(), grads=True),
-                )
-                logger.dump_tabular()
+                    logger.log_tabular(
+                        "Norm/Params/critic_model",
+                        get_params_norm(critic_model.parameters(), grads=False),
+                    )
+                    logger.log_tabular(
+                        "Norm/Grad/bc_policy",
+                        get_params_norm(actor.parameters(), grads=True),
+                    )
+                    logger.log_tabular(
+                        "Norm/Grad/cost_model",
+                        get_params_norm(cost_model.parameters(), grads=True),
+                    )
+                    logger.log_tabular(
+                        "Norm/Grad/critic_model",
+                        get_params_norm(critic_model.parameters(), grads=True),
+                    )
+                    logger.dump_tabular()
+                else:
+                    # Sync only at log time (1 sync per log_freq steps)
+                    nu_avg = (acc_nu_loss / acc_count).item()
+                    pi_avg = (acc_pi_loss / acc_count).item()
+                    tb_writer.add_scalar('Loss/bc_policy', pi_avg, steps)
+                    tb_writer.add_scalar('Loss/critic', nu_avg, steps)
+                    tb_writer.add_scalar('Metrics/alpha', alpha, steps)
+                    # Reset accumulators
+                    acc_nu_loss = 0.0
+                    acc_pi_loss = 0.0
+                    acc_count = 0
 
             if steps % config["save_freq"] == 0:
                 logger.torch_save(
@@ -550,6 +582,7 @@ def main(args, cfg_env=None):
     logger.torch_save(itr=steps, torch_saver_elements=actor, prefix="bc_policy")
     logger.torch_save(itr=steps, torch_saver_elements=cost_model, prefix="cost")
     logger.torch_save(itr=steps, torch_saver_elements=critic_model, prefix="critic")
+    tb_writer.close()
     logger.close()
 
 
