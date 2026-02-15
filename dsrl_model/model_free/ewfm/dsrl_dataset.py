@@ -30,46 +30,68 @@ def get_post_processed_dataset(env, data, config, task):
 def to_d4rl_format(data, ep_len):
     dones_idx = np.where((data["terminals"] == 1) | (data["timeouts"] == 1))[0]
     d4rl_data = {k: [] for k in data.keys()}
+    masks = []
     for i in range(dones_idx.shape[0]):
         start = 0 if i == 0 else dones_idx[i - 1] + 1
         end = dones_idx[i] + 1
+        traj_len = end - start
+
+        mask = np.ones(ep_len, dtype=np.float32)
+        mask[traj_len:] = 0.0
+        masks.append(mask)
+    
+    
         for k, v in data.items():
             val = v[start:end]
-            if ep_len != (end - start):
-                repeat_len = ep_len - (end - start)
+            if traj_len < ep_len:
+                repeat_len = ep_len - traj_len
                 other_dim = (1,) * (len(val.shape) - 1)
-                repeat_val = np.tile(val[-1], (repeat_len, *other_dim))
+                repeat_val = np.tile(val[-1], (repeat_len, *other_dim)) 
                 val = np.concatenate([val, repeat_val])
+            
             d4rl_data[k].append(val)
+
+    d4rl_data["mask"] = np.array(masks)
+    print("d4rl done")
     return {k: np.array(v) for k, v in d4rl_data.items()}
 
 
-def fold_sa_pair(data: np.array, num_folds):
+def fold_sa_pair(data: np.array, mask: np.array, num_folds):
     assert num_folds > 0, "number of folds cannot be less than 1."
     folded_data = []
-    for traj in data:
+    print("folding data")
+    for traj, traj_mask in zip(data, mask):
         for idx in range(num_folds):
             t = idx
             folded_traj = []
+
             while t < traj.shape[0]:
                 v = traj[t]
                 t += 1
+
                 for _ in range(1, num_folds):
+                    if t < traj.shape[0]:
+                        # ONLY accumulate if this timestep is real (mask==1)
+                        if np.isscalar(traj[t]) and traj_mask[t] == 1.0:
+                            v += traj[t]
                     t += 1
-                    if (t < traj.shape[0]) and (np.isscalar(traj[t])):
-                        v += traj[t]
+
                 folded_traj.append(v)
+
             folded_data.append(folded_traj)
+    print("folding over")
     return np.array(folded_data)
+
 
 
 def get_dataset_in_d4rl_format(env, config, task, ep_len, num_folds=1):
     data = env.get_dataset()
+    print("get raw dataset")
     data = get_post_processed_dataset(env, data, config, task)
-
+    print("get dataset in d4rl format")
     d4rl_data = to_d4rl_format(data, ep_len)
-    keys = ["observations", "actions", "rewards", "costs", "terminals", "timeouts"]
-    return {k: fold_sa_pair(d4rl_data[k], num_folds) for k in keys}
+    keys = ["observations", "actions", "rewards", "costs", "terminals", "timeouts", "mask"]
+    return {k: fold_sa_pair(d4rl_data[k], d4rl_data["mask"], num_folds) for k in keys}
 
 
 def get_neg_and_union_data_2(d4rl_data, config):
@@ -100,7 +122,7 @@ def get_neg_and_union_data_2(d4rl_data, config):
     num_union_traj = len(union_idx) if num_union_traj < 0 else num_union_traj
     union_shuffled_idx = np.random.choice(union_idx, size=num_union_traj, replace=False)
 
-    keys = ["observations", "actions", "rewards", "costs", "terminals", "timeouts"]
+    keys = ["observations", "actions", "rewards", "costs", "terminals", "timeouts", "mask"]
     neg_data = {k: d4rl_data[k][neg_shuffled_idx] for k in keys}
     union_data = {k: d4rl_data[k][union_shuffled_idx] for k in keys}
 
@@ -123,9 +145,11 @@ def get_neg_and_union_data_2(d4rl_data, config):
 def get_neg_and_positive_data(d4rl_data, config):
     # Returns: neg_data (pure worst trajectories), union_data (all positives + sampled negatives)
     # Note: Trajectories can overlap between neg_data and union_data (sampling WITH replacement across sets)
-    
-    traj_cost = np.sum(d4rl_data["costs"], axis=1)
-    traj_reward = np.sum(d4rl_data["rewards"], axis=1)
+    print("now sampling")
+    mask = d4rl_data["mask"]
+
+    traj_cost = np.sum(d4rl_data["costs"] * mask, axis=1)
+    traj_reward = np.sum(d4rl_data["rewards"] * mask, axis=1)
 
     true_percentage = 1.0 - config["non_pref_noise"]
 
@@ -136,7 +160,7 @@ def get_neg_and_positive_data(d4rl_data, config):
     reward_min, reward_max = np.min(traj_reward), np.max(traj_reward)
     cost_range = cost_max - cost_min
     reward_range = reward_max - reward_min
-
+    print("now sampling")
     # Negative: union of [reward 0-25%, any cost] and [any reward, cost 70-100%]
     low_reward_idx = np.where(traj_reward <= reward_min + 0.25 * reward_range)[0]
     high_cost_idx = np.where(traj_cost >= cost_min + 0.70 * cost_range)[0]
@@ -147,6 +171,11 @@ def get_neg_and_positive_data(d4rl_data, config):
         (traj_reward >= reward_min + 0.50 * reward_range) &
         (traj_cost <= cost_min + 0.20 * cost_range)
     )[0]
+
+    # Limit positive trajectories to 150; if more, randomly sample 150
+    max_pos_traj = 150
+    if len(pos_idx) > max_pos_traj:
+        pos_idx = np.random.choice(pos_idx, size=max_pos_traj, replace=False)
 
     # --- Sample pure negative trajectories (worst trajectories) ---
     # Sample from neg_idx, allow replacement if needed
@@ -173,13 +202,13 @@ def get_neg_and_positive_data(d4rl_data, config):
     # --- Positive: all positive trajectories ---
     # Keep all positives (no exclusion based on neg sets)
 
-    keys = ["observations", "actions", "rewards", "costs", "terminals", "timeouts"]
+    keys = ["observations", "actions", "rewards", "costs", "terminals", "timeouts", "mask"]
     neg_data = {k: d4rl_data[k][pure_neg_idx] for k in keys}
     pos_data = {k: d4rl_data[k][pos_idx] for k in keys}
-    union_neg_data = {k: d4rl_data[k][union_neg_idx] for k in keys}
+    union_neg_data = {k: d4rl_data[k][union_neg_idx] for k in keys}               
 
     # Build union dataset: all positives + sampled negatives
-    union_data = {k: np.concatenate([pos_data[k], union_neg_data[k]], axis=0) for k in keys}
+    union_data = {k: np.concatenate([pos_data[k], union_neg_data[k]], axis=0) for k in keys}  
 
     print(f"Number of pure negative trajectory dataset: {neg_data['observations'].shape[0]}")
     neg_cost, neg_reward = neg_data["costs"].sum(1).mean(), neg_data["rewards"].sum(1).mean()
@@ -197,7 +226,7 @@ def get_neg_and_positive_data(d4rl_data, config):
     union_cost, union_reward = union_data["costs"].sum(1).mean(), union_data["rewards"].sum(1).mean()
     print(f"Avg union trajectory cost/reward: {union_cost:.3f}/{union_reward:.3f}")
 
-    return neg_data, union_data
+    return neg_data, union_data        #### returning pos_data for behavior cloning on positive set
     
 def get_neg_and_union_data(d4rl_data, config):
     traj_cost = np.sum(d4rl_data["costs"], axis=1)

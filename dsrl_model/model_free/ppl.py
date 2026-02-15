@@ -3,6 +3,7 @@ import os.path as osp
 import random
 import re
 import sys
+from pathlib import Path
 import time
 from collections import deque
 
@@ -15,10 +16,14 @@ import torch.nn.functional as F
 from torch.nn.utils.clip_grad import clip_grad_norm_
 from torch.optim.lr_scheduler import LinearLR
 
-from dsrl_model.utils.bufffer import OnPolicyBuffer
+current_file = Path(__file__).resolve()
+offline_mpc_dir = current_file.parents[2]  # Go up 2 levels to reach offline_mpc
+sys.path.insert(0, str(offline_mpc_dir))
+
+from dsrl_model.utils.bufffer import SafeDiceBuffer
 from dsrl_model.utils.dsrl_dataset import (
     get_dataset_in_d4rl_format,
-    get_neg_and_union_data_2,
+    get_neg_and_positive_data,
 )
 from dsrl_model.utils.logger import EpochLogger
 from dsrl_model.utils.models import (
@@ -107,13 +112,7 @@ def bc_policy_loss_fn(
     target_act,
     config,
 ):
-    loss = 0.0
-    # Horizon X Batch X obs/act_dim
-    horizon, batch_size, _ = target_obs.shape
-
-    target_obs = target_obs.view(horizon * batch_size, -1)
-    target_act = target_act.view(horizon * batch_size, -1)
-
+    # Batch X obs/act_dim (flat batches)
     if config["policy_type"] == "vae":
         pred_act, bc_mean, bc_std = bc_policy(target_obs, target_act)
         recon_loss = F.mse_loss(pred_act, target_act, reduction="none").sum(dim=1)
@@ -123,8 +122,7 @@ def bc_policy_loss_fn(
         loss = recon_loss + 0.5 * kl_loss
     else:
         pred_act, *_ = bc_policy(target_obs)
-        recon_loss = F.mse_loss(pred_act, target_act, reduction="none").sum(dim=1)
-        loss = recon_loss
+        loss = F.mse_loss(pred_act, target_act, reduction="none").sum(dim=1)
 
     return torch.mean(loss)
 
@@ -197,21 +195,14 @@ def main(args, cfg_env=None):
     #     warmup_steps=1000,
     # )
 
-    # data
+    # data - only use union data for BC
     agent_task = re.search(r"Offline(.*?)Gymnasium-v[0-9]", args.task).group(1)
     ep_len = dsrl_infos.DEFAULT_MAX_EPISODE_STEPS[agent_task]
     data = get_dataset_in_d4rl_format(
         eval_env, trajectory_cfg, args.task, ep_len, config["action_repeat"]
     )
-    neg_data, union_data = get_neg_and_union_data_2(data, trajectory_cfg)
-    # neg_data, union_data, mu_obs, std_obs = get_normalized_data(neg_data, union_data)
-    neg_observations = torch.as_tensor(
-        neg_data["observations"], dtype=torch.float32, device=device
-    )
-    neg_actions = torch.as_tensor(
-        neg_data["actions"], dtype=torch.float32, device=device
-    )
-    neg_dones = neg_data["timeouts"] | neg_data["terminals"]
+    _, union_data = get_neg_and_positive_data(data, trajectory_cfg)
+    
     union_observations = torch.as_tensor(
         union_data["observations"], dtype=torch.float32, device=device
     )
@@ -221,22 +212,24 @@ def main(args, cfg_env=None):
     union_dones = union_data["timeouts"] | union_data["terminals"]
 
     ep_len = ep_len // config["action_repeat"] + (ep_len % config["action_repeat"] > 0)
-    assert (
-        neg_observations.shape[1] == ep_len
-    ), f"{neg_observations.shape[1]} episode length is different from {ep_len}"
 
-    buffer = OnPolicyBuffer(
+    # Use SafeDiceBuffer - add dummy neg data since buffer requires it
+    buffer = SafeDiceBuffer(
         obs_dim=obs_space.shape[0],
         act_dim=act_space.shape[0],
-        neg_data_size=np.prod(neg_observations.shape[:-1]),
+        neg_data_size=ep_len,
         union_data_size=np.prod(union_observations.shape[:-1]),
-        horizon=config["train_horizon"],
         batch_size=batch_size * config["bag_size"],
         device=device,
         ep_len=ep_len,
     )
-    for obs, act, done in zip(neg_observations, neg_actions, neg_dones):
-        buffer.add(obs, act, done, is_negative=True)
+    # Add dummy negative trajectory
+    buffer.add(
+        torch.zeros((ep_len, obs_space.shape[0]), device=device),
+        torch.zeros((ep_len, act_space.shape[0]), device=device),
+        np.zeros(ep_len, dtype=bool),
+        is_negative=True,
+    )
     for obs, act, done in zip(union_observations, union_actions, union_dones):
         buffer.add(obs, act, done, is_negative=False)
 
@@ -257,19 +250,12 @@ def main(args, cfg_env=None):
 
     steps = 0
     while steps < config["total_iteration"]:
-        # shape: Horizon X Batch X obs/act_dim
-        for (
-            _target_neg_obs,
-            _target_neg_act,
-            target_union_obs,
-            target_union_act,
-            _,
-        ) in buffer.sample():
-
+        # SafeDiceBuffer: (init_obs, neg_obs, neg_act, neg_next, union_obs, union_act, union_next)
+        for _, _, _, _, union_obs, union_act, _ in buffer.sample():
             bc_policy_loss = bc_policy_loss_fn(
                 bc_policy=bc_policy,
-                target_obs=target_union_obs,
-                target_act=target_union_act,
+                target_obs=union_obs,
+                target_act=union_act,
                 config=config,
             )
             bc_policy_optimizer.zero_grad()
@@ -357,7 +343,8 @@ if __name__ == "__main__":
     subfolder = "-".join(["seed", str(args.seed).zfill(3)])
     relpath = "-".join([subfolder, relpath])
     algo = os.path.basename(__file__).split(".")[0]
-    args.log_dir = os.path.join(args.log_dir, args.experiment, args.task, algo, relpath)
+    base_log_dir = os.path.join(str(offline_mpc_dir), "logs")
+    args.log_dir = os.path.join(base_log_dir, args.experiment, args.task, algo, relpath)
     if not args.write_terminal:
         terminal_log_name = "terminal.log"
         error_log_name = "error.log"

@@ -21,7 +21,7 @@ import matplotlib.pyplot as plt
 import matplotlib
 matplotlib.use('Agg')  # Non-interactive backend for server environments
 from torch.utils.tensorboard import SummaryWriter
-
+from pathlib import Path
 sys.path.append(osp.abspath(osp.join(osp.dirname(__file__), '../../..')))
 
 import gymnasium as gym
@@ -30,11 +30,15 @@ import dsrl.offline_safety_gymnasium
 
 from diffusion_SDE.model import ScoreNet, TwinQ, update_target
 from dsrl_model.utils.logger import EpochLogger
+from dsrl_model.utils.utils import single_agent_args
 from dsrl_dataset import (
     get_dataset_in_d4rl_format,
     get_normalized_data,
     get_neg_and_positive_data
 )
+current_file = Path(__file__).resolve()
+offline_mpc_dir = current_file.parents[3]  # Go up 3 levels to reach offline_mpc
+#sys.path.insert(0, str(offline_mpc_dir))
 
 EP = 1e-6
 
@@ -103,21 +107,28 @@ def u_t_ot_jit(x_t: torch.Tensor, x1: torch.Tensor, t: torch.Tensor, sigma_min: 
 
 
 @torch.jit.script
-def compute_segment_weights_jit(energy_flat: torch.Tensor, gamma_powers: torch.Tensor, 
-                                B: int, H: int, alpha: float) -> tuple[torch.Tensor, torch.Tensor]:
+def compute_segment_weights_jit(energy_flat: torch.Tensor, gamma_powers: torch.Tensor, mask_flat: torch.Tensor, 
+                                B: int, H: int,  alpha: float) -> tuple[torch.Tensor, torch.Tensor]:
     """"""
     energy_seg = energy_flat.view(B, H)
-    A_seg = (energy_seg * gamma_powers).sum(dim=1)
+    mask_seg = mask_flat.view(B, H)
+    A_seg = (energy_seg * gamma_powers * mask_seg).sum(dim=1)
     w_seg = F.softmax((alpha * A_seg).clamp(-20.0, 20.0), dim=0)
     return w_seg, A_seg
 
 
 @torch.jit.script
-def compute_weighted_loss_jit(v_theta: torch.Tensor, u_t: torch.Tensor, w_seg: torch.Tensor, B: int, H: int) -> torch.Tensor:
+def compute_weighted_loss_jit(v_theta: torch.Tensor, u_t: torch.Tensor, w_seg: torch.Tensor, mask_flat: torch.Tensor, B: int, H: int) -> torch.Tensor:
 
-    err = ((v_theta - u_t) ** 2).sum(dim=1)  # [B*H]
+    err = ((v_theta - u_t) ** 2).sum(dim=1)
+    err = err * mask_flat
     err_seg = err.view(B, H)
-    return (w_seg.unsqueeze(1) * err_seg).sum() / H
+
+    valid_counts = mask_flat.view(B, H).sum(dim=1).clamp(min=1.0)
+
+    weighted = (w_seg.unsqueeze(1) * err_seg).sum(dim=1)
+
+    return (weighted / valid_counts).mean()
 
 
 class TrainingBuffers:
@@ -190,9 +201,13 @@ class VNetwork(nn.Module):
         return self.net(s).squeeze(-1)
 
 
-def sample_segment_batch_fast(neg_obs, neg_act, union_obs, union_act, buffers, return_prev_actions=False):
+def sample_segment_batch_fast(neg_obs, neg_act, neg_mask, neg_valid_len,
+                              union_obs, union_act, union_mask, union_valid_len,
+                              buffers, return_prev_actions=False):
     """
-        return_prev_actions: If True, include 'prev_a' in returned dicts
+        Samples segments from valid (non-padded) regions only.
+        *_valid_len: (n_traj,) tensor of valid timestep counts per trajectory.
+        Also returns mask_next so that s_next at padded boundaries can be handled.
     """
     B = buffers.batch_size
     k = buffers.segment_len
@@ -201,13 +216,17 @@ def sample_segment_batch_fast(neg_obs, neg_act, union_obs, union_act, buffers, r
     
     n_neg, T_neg = neg_obs.shape[:2]
     n_union, T_union = union_obs.shape[:2]
-    max_neg = T_neg - k - 1
-    max_union = T_union - k - 1
 
     idx_neg = torch.randint(0, n_neg, (B,), device=device)
     idx_union = torch.randint(0, n_union, (B,), device=device)
-    start_neg = torch.randint(0, max_neg + 1, (B,), device=device)
-    start_union = torch.randint(0, max_union + 1, (B,), device=device)
+
+    # Clamp start so segment + 1 (for s_next) fits within valid region
+    # max_start_i = valid_len_i - k - 1, clamped to >= 0
+    max_start_neg = (neg_valid_len[idx_neg] - k - 1).clamp(min=0)
+    max_start_union = (union_valid_len[idx_union] - k - 1).clamp(min=0)
+    # Uniform sample in [0, max_start_i]
+    start_neg = (torch.rand(B, device=device) * (max_start_neg.float() + 1)).long().clamp(max=T_neg - k - 1)
+    start_union = (torch.rand(B, device=device) * (max_start_union.float() + 1)).long().clamp(max=T_union - k - 1)
 
     neg_time_idx = start_neg.unsqueeze(1) + offsets
     neg_time_next = neg_time_idx + 1
@@ -215,17 +234,29 @@ def sample_segment_batch_fast(neg_obs, neg_act, union_obs, union_act, buffers, r
     neg_s = neg_obs[idx_neg_exp, neg_time_idx]
     neg_a = neg_act[idx_neg_exp, neg_time_idx]
     neg_s_next = neg_obs[idx_neg_exp, neg_time_next]
-    
+    neg_m = neg_mask[idx_neg_exp, neg_time_idx]
+    neg_m_next = neg_mask[idx_neg_exp, neg_time_next]  # mask for s_next validity
+
     union_time_idx = start_union.unsqueeze(1) + offsets
     union_time_next = union_time_idx + 1
     idx_union_exp = idx_union.unsqueeze(1).expand(-1, k)
     union_s = union_obs[idx_union_exp, union_time_idx]
     union_a = union_act[idx_union_exp, union_time_idx]
     union_s_next = union_obs[idx_union_exp, union_time_next]
+    union_m = union_mask[idx_union_exp, union_time_idx]
+    union_m_next = union_mask[idx_union_exp, union_time_next]  # mask for s_next validity
 
     result = {
-        'neg': {'s': neg_s.transpose(0, 1), 'a': neg_a.transpose(0, 1), 's_next': neg_s_next.transpose(0, 1)},
-        'union': {'s': union_s.transpose(0, 1), 'a': union_a.transpose(0, 1), 's_next': union_s_next.transpose(0, 1)}
+        'neg': {
+            's': neg_s.transpose(0, 1), 'a': neg_a.transpose(0, 1),
+            's_next': neg_s_next.transpose(0, 1), 'mask': neg_m.transpose(0, 1),
+            'mask_next': neg_m_next.transpose(0, 1)
+        },
+        'union': {
+            's': union_s.transpose(0, 1), 'a': union_a.transpose(0, 1),
+            's_next': union_s_next.transpose(0, 1), 'mask': union_m.transpose(0, 1),
+            'mask_next': union_m_next.transpose(0, 1)
+        }
     }
     
     if return_prev_actions:
@@ -248,9 +279,10 @@ def sample_transitions_fast(union_obs, union_act, batch_size, device):
     return union_obs[idx, t_idx], union_act[idx, t_idx]
 
 
-def sample_flow_segments_fast(union_obs, union_act, buffers, horizon=None, return_prev_actions=False):
+def sample_flow_segments_fast(union_obs, union_act, union_mask, union_valid_len, buffers, horizon=None, return_prev_actions=False):
     """
-        return_prev_actions: If True, also return prev_actions [B, H, act_dim] where
+        Samples flow training segments from valid (non-padded) regions only.
+        union_valid_len: (n_traj,) tensor of valid timestep counts per trajectory.
     """
     B = buffers.batch_size
     H = horizon if horizon is not None else buffers.horizon
@@ -258,25 +290,27 @@ def sample_flow_segments_fast(union_obs, union_act, buffers, horizon=None, retur
     device = buffers.device
     
     n, T = union_obs.shape[:2]
-    max_start = T - H
     
     traj_idx = torch.randint(0, n, (B,), device=device)
-    start_idx = torch.randint(0, max_start, (B,), device=device)
+    # Clamp start so segment fits within valid region: max_start_i = valid_len_i - H, >= 0
+    max_start = (union_valid_len[traj_idx] - H).clamp(min=0)
+    start_idx = (torch.rand(B, device=device) * (max_start.float() + 1)).long().clamp(max=T - H)
     
     time_idx = start_idx.unsqueeze(1) + offsets
     traj_exp = traj_idx.unsqueeze(1).expand(-1, H)
     
     seg_s = union_obs[traj_exp, time_idx]
     seg_a = union_act[traj_exp, time_idx]
+    seg_m = union_mask[traj_exp, time_idx]
     
     if not return_prev_actions:
-        return seg_s, seg_a
+        return seg_s, seg_a, seg_m
     
     # Compute prev_actions: shift actions by 1, pad first with zeros
     # Shape: [B, H, act_dim]
     prev_a = torch.zeros_like(seg_a)
     prev_a[:, 1:, :] = seg_a[:, :-1, :]
-    return seg_s, seg_a, prev_a
+    return seg_s, seg_a, seg_m, prev_a
 
 
 # ============== Loss Functions ==============
@@ -289,7 +323,10 @@ def ipl_preference_loss(q_critic, flow_model, batch_seg, gamma, chi2_coeff, targ
     seg_u, seg_n = batch_seg["union"], batch_seg["neg"]
     s_neg, a_neg, s_neg_next = seg_n["s"], seg_n["a"], seg_n["s_next"]
     s_uni, a_uni, s_uni_next = seg_u["s"], seg_u["a"], seg_u["s_next"]
- 
+    mask_neg = seg_n["mask"]          # (k, B)
+    mask_uni = seg_u["mask"]          # (k, B)
+    mask_neg_next = seg_n["mask_next"]  # (k, B) — validity of s_next
+    mask_uni_next = seg_u["mask_next"]  # (k, B)
     k, B, obs_dim = s_neg.shape
     N = B * k
 
@@ -299,6 +336,14 @@ def ipl_preference_loss(q_critic, flow_model, batch_seg, gamma, chi2_coeff, targ
     uni_s_flat = s_uni.permute(1, 0, 2).reshape(N, obs_dim)
     uni_a_flat = a_uni.permute(1, 0, 2).reshape(N, act_dim)
     uni_s_next_flat = s_uni_next.permute(1, 0, 2).reshape(N, obs_dim)
+
+    # Flatten masks in same B-major order: (k, B) -> (B, k) -> (B*k,)
+    mask_neg_flat = mask_neg.transpose(0, 1).reshape(N)
+    mask_uni_flat = mask_uni.transpose(0, 1).reshape(N)
+    mask_neg_next_flat = mask_neg_next.transpose(0, 1).reshape(N)
+    mask_uni_next_flat = mask_uni_next.transpose(0, 1).reshape(N)
+    mask_all = torch.cat([mask_neg_flat, mask_uni_flat], dim=0)          # (2N,)
+    mask_next_all = torch.cat([mask_neg_next_flat, mask_uni_next_flat], dim=0)  # (2N,)
 
     obs_all = torch.cat([neg_s_flat, uni_s_flat], dim=0)
     act_all = torch.cat([neg_a_flat, uni_a_flat], dim=0)
@@ -327,15 +372,26 @@ def ipl_preference_loss(q_critic, flow_model, batch_seg, gamma, chi2_coeff, targ
         if target_clip:
             q_lim = 1.0 / (chi2_coeff * (gamma + 1e-6))
             soft_q_next = soft_q_next.clamp(-q_lim, q_lim)
+        
+        # Zero out soft_q_next where s_next is padded (invalid)
+        # This makes the Bellman target Q(s,a) at boundary = reward only (no bootstrap)
+        soft_q_next = soft_q_next * mask_next_all
 
     # Soft reward = Q(s,a) - γ * soft_Q(s',a')
     reward = qs - gamma * soft_q_next
     r_neg = reward[:, :N].view(2, B, k)
     r_uni = reward[:, N:].view(2, B, k)
+    # Transpose masks from (k, B) -> (B, k) to match r layout (2, B, k)
+    mask_neg_bk = mask_neg.transpose(0, 1)
+    mask_uni_bk = mask_uni.transpose(0, 1)
+    r_neg = r_neg * mask_neg_bk.unsqueeze(0)
+    r_uni = r_uni * mask_uni_bk.unsqueeze(0)
 
     logits = r_uni.sum(dim=2) - r_neg.sum(dim=2)
     pref_loss = F.binary_cross_entropy_with_logits(logits, torch.ones_like(logits))
-    chi2_loss = 0.5 * chi2_coeff * reward.pow(2).mean()
+    
+    # Chi2 regularizer: only over valid (non-padded) timesteps
+    chi2_loss = 0.5 * chi2_coeff * (reward.pow(2) * mask_all.unsqueeze(0)).sum() / (mask_all.sum().clamp(min=1.0) * 2.0)
     
     return pref_loss + chi2_loss, r_uni.mean(), r_neg.mean(), logp_next.mean()
 
@@ -398,26 +454,33 @@ def plot_q_energy_grid(q_critic, neg_data, union_data, device, save_path, energy
     def process(data_dict):
         obs = torch.as_tensor(data_dict["observations"], device=device, dtype=torch.float32)
         acts = torch.as_tensor(data_dict["actions"], device=device, dtype=torch.float32)
+        mask = torch.as_tensor(data_dict["mask"], device=device, dtype=torch.float32)  # (B, T)
 
         B, T = obs.shape[:2]
 
         # Flatten
         obs_flat = obs.reshape(B * T, -1)
         act_flat = acts.reshape(B * T, -1)
+        mask_flat = mask.reshape(B * T)
 
         # Q critic
         q1, q2 = q_critic.both(obs_flat, act_flat)
         q = torch.min(q1, q2).squeeze(-1)
 
-        # Mean Q per trajectory
-        Q = q.reshape(B, T).mean(dim=1)
+        # Mean Q per trajectory (only over valid timesteps)
+        q_masked = (q.reshape(B, T) * mask)
+        valid_counts = mask.sum(dim=1).clamp(min=1.0)
+        Q = q_masked.sum(dim=1) / valid_counts
 
-        # Reward & cost
-        rewards = data_dict["rewards"].sum(axis=1)
-        costs   = data_dict["costs"].sum(axis=1)
+        # Reward & cost (only over valid timesteps)
+        rewards_np = data_dict["rewards"]
+        costs_np = data_dict["costs"]
+        mask_np = data_dict["mask"]
+        R = (rewards_np * mask_np).sum(axis=1)
+        C = (costs_np * mask_np).sum(axis=1)
 
-        R = rewards.cpu().numpy() if torch.is_tensor(rewards) else rewards
-        C = costs.cpu().numpy()   if torch.is_tensor(costs)   else costs
+        R = R.cpu().numpy() if torch.is_tensor(R) else R
+        C = C.cpu().numpy() if torch.is_tensor(C) else C
 
         return Q, R, C
 
@@ -524,7 +587,7 @@ def train_flow_matching_step(flow_model, flow_optimizer, q_critic,
 
 
 def train_flow_step_segment(flow_model, flow_optimizer, scaler, q_critic,
-                            seg_s, seg_a, gamma_powers, buffers, config, use_guidance=True,
+                            seg_s, seg_a, seg_mask, gamma_powers, buffers, config, use_guidance=True,
                             alpha=0.1, in_warmup=False, seg_prev_a=None):
     """
     segment based
@@ -540,7 +603,7 @@ def train_flow_step_segment(flow_model, flow_optimizer, scaler, q_critic,
     # Flatten segments: [B*H, dim]
     s_flat = seg_s.reshape(N, obs_dim)
     a_flat = seg_a.reshape(N, act_dim)
-    
+    mask_flat = seg_mask.reshape(-1)
     # Build condition: [obs] or [obs, prev_action]
     if use_prev_action and seg_prev_a is not None:
         prev_a_flat = seg_prev_a.reshape(N, act_dim)
@@ -554,7 +617,7 @@ def train_flow_step_segment(flow_model, flow_optimizer, scaler, q_critic,
             q_val = q_critic(s_flat, a_flat).squeeze(-1)
             energy_flat = q_val
             w_seg, A_seg = compute_segment_weights_jit(
-                energy_flat, gamma_powers, B, H, config.get('energy_alpha', 3.0)
+                energy_flat, gamma_powers, mask_flat, B, H, config.get('energy_alpha', 3.0)
             )
     else:
         w_seg = torch.full((B,), 1.0 / B, device=device)
@@ -573,7 +636,7 @@ def train_flow_step_segment(flow_model, flow_optimizer, scaler, q_critic,
     
     with torch.cuda.amp.autocast():
         v_theta = flow_model(x_t, t, condition=cond_flat)
-        fm_loss = compute_weighted_loss_jit(v_theta, u_t, w_seg, B, H)
+        fm_loss = compute_weighted_loss_jit(v_theta, u_t, w_seg, mask_flat, B, H)
     
     
     scaler.scale(fm_loss).backward()
@@ -620,7 +683,7 @@ def evaluate_flow_policy(eval_env, flow_model, device, norm_fn, diffusion_steps=
     
     return total_reward, total_cost, total_len
 
-def main(args):
+def main(args, cfg_env=None):
     config = {**default_cfg}
     for k, v in vars(args).items():
         if v is not None and k in config:
@@ -635,11 +698,8 @@ def main(args):
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
     
-    relpath = time.strftime("%Y-%m-%d-%H-%M-%S")
-    subfolder = f"seed-{str(args.seed).zfill(3)}"
-    relpath = f"{subfolder}-{relpath}"
-    algo = "ipl_flow_joint_training_v7"
-    args.log_dir = os.path.join(args.log_dir, args.experiment, args.task, algo, relpath)
+    
+    #args.log_dir = os.path.join(args.log_dir, args.experiment, args.task, algo, relpath)
     os.makedirs(args.log_dir, exist_ok=True)
     logger = EpochLogger(log_dir=args.log_dir, seed=str(args.seed))
     logger.save_config({**config, **vars(args)})
@@ -659,6 +719,7 @@ def main(args):
         "num_pure_negative_trajectories": config["num_pure_negative_trajectories"],
         "num_union_negative_trajectories": config["num_union_negative_trajectories"],
         "num_union_trajectories": config["num_union_trajectories"],
+        "num_negative_trajectories": 150,
         "non_pref_noise": 0.0,
     }
     
@@ -670,6 +731,13 @@ def main(args):
     d4rl_data = get_dataset_in_d4rl_format(eval_env, dataset_config, args.task, max_traj_len, num_folds=1)
     neg_data, union_data = get_neg_and_positive_data(d4rl_data, dataset_config) #get_neg_and_union_data_2(d4rl_data, dataset_config)
     
+    neg_mask = torch.as_tensor(neg_data['mask'], dtype=torch.float32, device=device)
+    union_mask = torch.as_tensor(union_data['mask'], dtype=torch.float32, device=device)
+    # Precompute valid lengths per trajectory (number of non-padded timesteps)
+    neg_valid_len = neg_mask.sum(dim=1).long()     # (n_neg,)
+    union_valid_len = union_mask.sum(dim=1).long()  # (n_union,)
+    
+
     mu_obs, std_obs = None, None
     if args.normalize_observation:
         neg_data, union_data, mu_obs, std_obs = get_normalized_data(neg_data, union_data)
@@ -777,15 +845,16 @@ def main(args):
         # ========== Sample Data ==========
         # Segment batch for IPL (only after warmup and if Q trainable)
         if not in_warmup and q_opt is not None:
-            batch_seg = sample_segment_batch_fast(neg_obs, neg_act, union_obs, union_act, buffers,
-                                                   return_prev_actions=use_prev_action)
+            batch_seg = sample_segment_batch_fast(neg_obs, neg_act, neg_mask, neg_valid_len,
+                                                   union_obs, union_act, union_mask, union_valid_len,
+                                                   buffers, return_prev_actions=use_prev_action)
         
         # Flow segments from union data 
         if use_prev_action:
-            seg_s, seg_a, seg_prev_a = sample_flow_segments_fast(union_obs, union_act, buffers, flow_horizon,
-                                                                  return_prev_actions=True)
+            seg_s, seg_a, seg_mask, seg_prev_a = sample_flow_segments_fast(union_obs, union_act, union_mask, union_valid_len,
+                                                                  buffers, flow_horizon, return_prev_actions=True)
         else:
-            seg_s, seg_a = sample_flow_segments_fast(union_obs, union_act, buffers, flow_horizon)
+            seg_s, seg_a, seg_mask = sample_flow_segments_fast(union_obs, union_act, union_mask, union_valid_len, buffers, flow_horizon)
             seg_prev_a = None
         
         # ========== Q-Learning Step (skip during warmup or if Q frozen) ==========
@@ -820,7 +889,7 @@ def main(args):
         
         flow_loss, A_seg_mean, A_seg_std, w_seg_max = train_flow_step_segment(
             flow_model, flow_opt, scaler, q_critic,
-            seg_s, seg_a, gamma_powers, buffers, config, use_guidance=use_flow_guidance,
+            seg_s, seg_a, seg_mask, gamma_powers, buffers, config, use_guidance=use_flow_guidance,
             alpha=alpha_val, in_warmup=in_warmup, seg_prev_a=seg_prev_a
         )
         acc_flow_loss += flow_loss.detach()
@@ -955,6 +1024,9 @@ if __name__ == "__main__":
     parser.add_argument("--weight_decay", type=float, default=1e-5)
     # Flow warmup & segment config
     parser.add_argument("--warmup_iterations", type=int, default=50000)
+    parser.add_argument("--num_pure_negative_trajectories", type=int, default=50)
+    parser.add_argument("--num_union_negative_trajectories", type=int, default=150)
+
     parser.add_argument("--horizon", type=int, default=10)
     parser.add_argument("--weight_from_q", action="store_true", default=True,
                         help="If True, use Q(s,a) for weights; else use advantage Q(s,a)-V(s)")
@@ -976,7 +1048,25 @@ if __name__ == "__main__":
     parser.add_argument("--pretrained_q_path", type=str, default=None,
                         help="Path to pretrained Q model checkpoint (.pt file)")
 
-    
     args = parser.parse_args()
+    
+    # Setup log directory
+    relpath = time.strftime("%Y-%m-%d-%H-%M-%S")
+    subfolder = "-".join(["seed", str(args.seed).zfill(3)])
+    relpath = "-".join([subfolder, relpath])
+    algo = osp.basename(__file__).split(".")[0]
+    base_log_dir = osp.join(str(offline_mpc_dir), "logs", "merged")
+    args.log_dir = osp.join(base_log_dir, args.experiment, args.task, algo, relpath)
     main(args)
+    """ terminal_log_name = f"seed{args.seed}_terminal.log"
+    error_log_name = f"seed{args.seed}_error.log"
+    sys.stdout = sys.__stdout__
+    sys.stderr = sys.__stderr__
+    if not osp.exists(args.log_dir):
+        os.makedirs(args.log_dir, exist_ok=True)
+    with open(osp.join(args.log_dir, terminal_log_name), "w", encoding="utf-8") as f_out:
+        sys.stdout = f_out
+        with open(osp.join(args.log_dir, error_log_name), "w", encoding="utf-8") as f_error:
+            sys.stderr = f_error
+            main(args) """
 

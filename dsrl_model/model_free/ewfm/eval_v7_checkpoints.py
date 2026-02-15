@@ -7,6 +7,7 @@ Usage: python eval_v7_checkpoints.py --ckpt_dir /path/to/logs --num_episodes 10
 import os
 import sys
 import json
+import csv
 import glob
 import argparse
 import time
@@ -212,6 +213,16 @@ def main():
     with open(output_path, 'w') as f:
         json.dump(output, f, indent=2)
     print(f"Saved: {output_path}")
+    
+    # Save CSV
+    csv_path = os.path.join(args.ckpt_dir, "eval_results.csv")
+    with open(csv_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['step', 'mean_reward', 'std_reward', 'mean_cost', 'std_cost'])
+        for itr in sorted(results.keys()):
+            res = results[itr]
+            writer.writerow([itr, res['reward_mean'], res['reward_std'], res['cost_mean'], res['cost_std']])
+    print(f"Saved: {csv_path}")
     
     env.close()
 

@@ -235,7 +235,7 @@ def main(args, cfg_env=None):
     data = get_dataset_in_d4rl_format(
         eval_env, trajectory_cfg, args.task, ep_len, config["action_repeat"]
     )
-    neg_data, union_data = get_neg_and_union_data_2(data, trajectory_cfg)
+    neg_data, union_data = get_neg_and_positive_data(data, trajectory_cfg)
     # neg_data, union_data, mu_obs, std_obs = get_normalized_data(neg_data, union_data)
     neg_observations = torch.as_tensor(
         neg_data["observations"], dtype=torch.float32, device=device
