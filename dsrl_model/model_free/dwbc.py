@@ -27,7 +27,7 @@ sys.path.insert(0, str(offline_mpc_dir))
 from dsrl_model.utils.bufffer import SafeDiceBuffer
 from dsrl_model.utils.dsrl_dataset import (
     get_dataset_in_d4rl_format,
-    get_neg_and_union_data_2,
+    get_neg_and_positive_data,
 )
 from dsrl_model.utils.logger import EpochLogger
 from dsrl_model.utils.models import (
@@ -67,7 +67,7 @@ trajectory_cfg = {
     # ((low_cost, low_reward), (high_cost, low_reward), (medium_cost, high_reward))
     "inpaint_ranges": None,
     "num_pure_negative_trajectories": 50,
-    "num_union_negative_trajectories": 150,
+    "num_union_negative_trajectories": 100,
     "num_union_trajectories": -1,
     "percentage_validation_trajectories": 0.2,
 }

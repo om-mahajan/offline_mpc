@@ -126,9 +126,11 @@ def compute_weighted_loss_jit(v_theta: torch.Tensor, u_t: torch.Tensor, w_seg: t
 
     valid_counts = mask_flat.view(B, H).sum(dim=1).clamp(min=1.0)
 
+    # w_seg sums to 1.0 (softmax), so .sum() gives the correct weighted expectation.
+    # Using .mean() would underscale the loss by a factor of B.
     weighted = (w_seg.unsqueeze(1) * err_seg).sum(dim=1)
 
-    return (weighted / valid_counts).mean()
+    return (weighted / valid_counts).sum()
 
 
 class TrainingBuffers:
