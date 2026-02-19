@@ -48,7 +48,8 @@ def to_d4rl_format(data, ep_len):
                 other_dim = (1,) * (len(val.shape) - 1)
                 repeat_val = np.tile(val[-1], (repeat_len, *other_dim)) 
                 val = np.concatenate([val, repeat_val])
-            
+                if traj_len<100:
+                    print(f"traj_len={traj_len}")
             d4rl_data[k].append(val)
 
     d4rl_data["mask"] = np.array(masks)
@@ -59,7 +60,6 @@ def to_d4rl_format(data, ep_len):
 def fold_sa_pair(data: np.array, mask: np.array, num_folds):
     assert num_folds > 0, "number of folds cannot be less than 1."
     folded_data = []
-    print("folding data")
     for traj, traj_mask in zip(data, mask):
         for idx in range(num_folds):
             t = idx
@@ -79,7 +79,6 @@ def fold_sa_pair(data: np.array, mask: np.array, num_folds):
                 folded_traj.append(v)
 
             folded_data.append(folded_traj)
-    print("folding over")
     return np.array(folded_data)
 
 
@@ -145,7 +144,7 @@ def get_neg_and_union_data_2(d4rl_data, config):
 def get_neg_and_positive_data(d4rl_data, config):
     # Returns: neg_data (pure worst trajectories), union_data (all positives + sampled negatives)
     # Note: Trajectories can overlap between neg_data and union_data (sampling WITH replacement across sets)
-    print("now sampling")
+    
     mask = d4rl_data["mask"]
 
     traj_cost = np.sum(d4rl_data["costs"] * mask, axis=1)
@@ -160,7 +159,7 @@ def get_neg_and_positive_data(d4rl_data, config):
     reward_min, reward_max = np.min(traj_reward), np.max(traj_reward)
     cost_range = cost_max - cost_min
     reward_range = reward_max - reward_min
-    print("now sampling")
+    
     # Negative: union of [reward 0-25%, any cost] and [any reward, cost 70-100%]
     low_reward_idx = np.where(traj_reward <= reward_min + 0.25 * reward_range)[0]
     high_cost_idx = np.where(traj_cost >= cost_min + 0.70 * cost_range)[0]
@@ -177,8 +176,7 @@ def get_neg_and_positive_data(d4rl_data, config):
     if len(pos_idx) > max_pos_traj:
         pos_idx = np.random.choice(pos_idx, size=max_pos_traj, replace=False)
 
-    # --- Sample pure negative trajectories (worst trajectories) ---
-    # Sample from neg_idx, allow replacement if needed
+    
     num_pure_neg_traj = min(len(neg_idx), num_pure_neg_traj)
     num_true_pure_neg = int(num_pure_neg_traj * true_percentage)
     num_false_pure_neg = num_pure_neg_traj - num_true_pure_neg

@@ -9,7 +9,7 @@ import sys
 import time
 import functools
 from copy import deepcopy
-
+import random
 import numpy as np
 import torch
 import torch.nn as nn
@@ -75,7 +75,7 @@ default_cfg = {
     "num_pure_negative_trajectories": 50,
     "num_union_negative_trajectories": 150,
     "num_union_trajectories": -1,
-    "segment_length": 25,
+    "segment_length": 10, ################################Om changed-19/02/2026 - change back to 25 after testing is done #####
     "sigma_min": 0.01,
     # SAC entropy regularization
     "alpha": 0.1,
@@ -695,6 +695,11 @@ def main(args, cfg_env=None):
                          else f"{args.device}:{getattr(args, 'device_id', 0)}")
     args.device = device
     
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    random.seed(args.seed)
+    if device.type == 'cuda':
+        torch.cuda.manual_seed_all(args.seed)
     # Enable performance optimizations
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
